@@ -22,21 +22,18 @@ ACHIEVEMENTS: dict[str, dict] = {
     "first_book": {
         "name": "卧龙出山",
         "sub": "首次动笔",
-        "medal": "medal_first_book.png",
         "cond": "创立你的第一本书",
         "praise": "第一本书已经立项，卧龙今日出山！愿你落笔千言、文思泉涌，笔下自有一方风云天地。",
     },
     "marathon": {
         "name": "挥斥方遒",
         "sub": "笔力迸发",
-        "medal": "medal_marathon.png",
         "cond": "单次写作超过一小时",
         "praise": "连续伏案一小时，笔力愈发雄浑！文思正盛，请尽情挥斥方遒，书写你的锦绣文章。",
     },
     "persistent": {
         "name": "坚持不懈",
         "sub": "日日不辍",
-        "medal": "medal_persistent.png",
         "cond": "连续一个月每天都更新 500 字以上",
         "praise": "整整一个月天天动笔、字字耕耘，这份坚持令人敬佩！作为奖励，历史版本容量已扩至 7 个。",
     },
@@ -44,28 +41,24 @@ ACHIEVEMENTS: dict[str, dict] = {
     "words_30k": {
         "name": "墨积成卷",
         "sub": "三万字里程碑",
-        "medal": "",
         "cond": "单本作品累计码字达到 30000 字",
         "praise": "点滴落笔，积字成卷。一字一句积攒，书稿初具篇幅。",
     },
     "words_100k": {
         "name": "笔筑千章",
         "sub": "十万字里程碑",
-        "medal": "",
         "cond": "单本作品累计码字达到 100000 字",
         "praise": "挥毫筑章，骨架已成。以笔墨搭建起完整的故事篇章。",
     },
     "words_300k": {
         "name": "瀚墨连篇",
         "sub": "三十万字里程碑",
-        "medal": "",
         "cond": "单本作品累计码字达到 300000 字",
         "praise": "瀚墨滔滔，篇章连绵。笔墨化作瀚海，故事绵延不绝。",
     },
     "words_1m": {
         "name": "鸿篇铸就",
         "sub": "百万字里程碑",
-        "medal": "",
         "cond": "单本作品累计码字达到 1000000 字",
         "praise": "千锤百炼，鸿篇终铸。百万字巨作落成，故事蔚为大观。",
     },
@@ -73,28 +66,24 @@ ACHIEVEMENTS: dict[str, dict] = {
     "hiatus_15d": {
         "name": "太监断更",
         "sub": "十五日未更",
-        "medal": "",
         "cond": "单本作品连续 15 天没有新增有效码字",
         "praise": "行文半路，笔墨骤停。故事搁置，前路悬而未续。",
     },
     "hiatus_30d": {
         "name": "久搁弃章",
         "sub": "三十日未续",
-        "medal": "",
         "cond": "单本作品连续 30 天没有新增有效码字",
         "praise": "篇章久搁，弃兆已生。故事长久封存，再不动笔或将彻底放弃。",
     },
     "hiatus_180d": {
         "name": "旧稿荒坟",
         "sub": "半载未更",
-        "medal": "",
         "cond": "单本作品连续 180 天没有新增有效码字",
         "praise": "残稿埋尘，稿作成墟。半载搁置，文稿已经埋没在岁月荒雾之中。",
     },
     "hiatus_365d": {
         "name": "文魂永寂",
         "sub": "一载封笔",
-        "medal": "",
         "cond": "单本作品连续 365 天没有新增有效码字",
         "praise": "文星熄灭，笔墨长眠。故事沉寂一载，续写的希望几近消散。",
     },
@@ -102,7 +91,6 @@ ACHIEVEMENTS: dict[str, dict] = {
     "rebirth": {
         "name": "英雄重生",
         "sub": "沉寂一载，提笔归来",
-        "medal": "",
         "cond": "达成文魂永寂后，首次新增有效码字 500 字",
         "praise": "文星曾寂，久封笔墨；一朝拾卷，英雄重生。于死寂之中重新拾起搁置一年的故事。",
     },
@@ -126,22 +114,6 @@ HIATUS_THRESHOLDS: list[tuple[str, int]] = [
 
 # 「坚持不懈」解锁后，历史版本上限加成
 PERSISTENT_HISTORY_BONUS = 2
-
-
-def medal_file(key: str):
-    """返回勋章图片的绝对路径；成就不存在或未配置图片文件时返回 None。
-
-    勋章美术现已改由 app/ui/medal_art.py 程序绘制（medal_pixmap），
-    此函数仅作为旧 PNG 资源的兼容回退。
-    """
-    info = ACHIEVEMENTS.get(key)
-    if info is None:
-        return None
-    name = str(info.get("medal") or "")
-    if not name:
-        return None
-    path = config.ASSETS_DIR / name
-    return path if path.exists() else None
 
 
 class AchievementManager:

@@ -43,7 +43,7 @@ class IconFactory:
         painter.scale(size * 2 / CANVAS, size * 2 / CANVAS)
 
         pen = QPen(self.color)
-        pen.setWidthF(1.6)
+        pen.setWidthF(1.7)
         pen.setCapStyle(Qt.RoundCap)
         pen.setJoinStyle(Qt.RoundJoin)
         painter.setPen(pen)
@@ -66,7 +66,7 @@ class IconFactory:
 
         elif name == "toc":
             for y in (7, 12, 17):
-                p.drawEllipse(QPointF(5.6, y), 1.0, 1.0)
+                p.drawEllipse(QPointF(5.6, y), 1.3, 1.3)
                 p.drawLine(QPointF(9, y), QPointF(20.5, y))
 
         elif name == "undo":
@@ -79,11 +79,9 @@ class IconFactory:
             p.restore()
 
         elif name == "format":
-            p.drawLine(QPointF(5, 19), QPointF(14.2, 9.8))
-            p.drawLine(QPointF(16.8, 4), QPointF(16.8, 9.4))
-            p.drawLine(QPointF(14.1, 6.7), QPointF(19.5, 6.7))
-            p.drawLine(QPointF(19.8, 13), QPointF(19.8, 16.6))
-            p.drawLine(QPointF(18, 14.8), QPointF(21.6, 14.8))
+            # 排版：四条左对齐、长短不一的横线（对齐样式，笔画完整不易碎）
+            for y, x2 in ((5.5, 20), (10.3, 14.5), (15.1, 20), (19.9, 12.5)):
+                p.drawLine(QPointF(4, y), QPointF(x2, y))
 
         elif name == "find":
             p.drawEllipse(QRectF(5, 5, 10, 10))
@@ -115,13 +113,24 @@ class IconFactory:
             p.drawText(QRectF(0, 1.5, 24, 20), Qt.AlignCenter, "A")
 
         elif name == "spacing":
-            for y in (6.5, 11, 15.5):
-                p.drawLine(QPointF(3.6, y), QPointF(15, y))
-            p.drawLine(QPointF(18.6, 5), QPointF(18.6, 19))
-            p.drawLine(QPointF(18.6, 5), QPointF(16.2, 7.4))
-            p.drawLine(QPointF(18.6, 5), QPointF(21, 7.4))
-            p.drawLine(QPointF(18.6, 19), QPointF(16.2, 16.6))
-            p.drawLine(QPointF(18.6, 19), QPointF(21, 16.6))
+            # 行距：三条横线 + 右侧双向实心箭头（细斜线在小尺寸下看不清）
+            for y in (7, 12, 17):
+                p.drawLine(QPointF(3.6, y), QPointF(14.5, y))
+            p.drawLine(QPointF(19.6, 7.8), QPointF(19.6, 16.2))
+            p.setBrush(self.color)
+            p.setPen(Qt.NoPen)
+            top = QPainterPath()
+            top.moveTo(19.6, 3.8)
+            top.lineTo(17.0, 8.0)
+            top.lineTo(22.2, 8.0)
+            top.closeSubpath()
+            bottom = QPainterPath()
+            bottom.moveTo(19.6, 20.2)
+            bottom.lineTo(17.0, 16.0)
+            bottom.lineTo(22.2, 16.0)
+            bottom.closeSubpath()
+            p.drawPath(top)
+            p.drawPath(bottom)
 
         elif name == "history":
             p.drawEllipse(QRectF(5, 5, 14, 14))
@@ -149,12 +158,12 @@ class IconFactory:
             for i in range(8):
                 angle = math.radians(i * 45)
                 p.drawLine(
-                    QPointF(12 + 7.5 * math.cos(angle), 12 + 7.5 * math.sin(angle)),
-                    QPointF(12 + 9.4 * math.cos(angle), 12 + 9.4 * math.sin(angle)),
+                    QPointF(12 + 7.2 * math.cos(angle), 12 + 7.2 * math.sin(angle)),
+                    QPointF(12 + 9.0 * math.cos(angle), 12 + 9.0 * math.sin(angle)),
                 )
             p.setBrush(self.color)
             p.setPen(Qt.NoPen)
-            p.drawEllipse(QRectF(9.6, 9.6, 4.8, 4.8))
+            p.drawEllipse(QRectF(9.7, 9.7, 4.6, 4.6))
 
         elif name == "top":
             p.drawLine(QPointF(12, 19.4), QPointF(12, 5.2))
@@ -342,15 +351,22 @@ class IconFactory:
 
 
 def _draw_undo(self, p: QPainter) -> None:
-    """绘制“撤销”弧形箭头（供 redo 镜像复用）。"""
-    path = QPainterPath()
-    path.moveTo(7, 8.5)
-    path.lineTo(11.5, 8.5)
-    path.cubicTo(18, 8.5, 18, 17, 11.5, 17)
-    path.lineTo(7.5, 17)
-    p.drawPath(path)
-    p.drawLine(QPointF(7, 8.5), QPointF(10.8, 4.7))
-    p.drawLine(QPointF(7, 8.5), QPointF(10.8, 12.3))
+    """绘制“撤销”圆弧箭头（3/4 圆弧 + 实心箭头，供 redo 镜像复用）。"""
+    p.drawArc(QRectF(5.5, 6.5, 13, 13), 30 * 16, 285 * 16)
+    # 弧线起点（右上 30°）沿切线方向的实心箭头
+    cx, cy, r = 12.0, 13.0, 6.5
+    a = math.radians(30)
+    px, py = cx + r * math.cos(a), cy - r * math.sin(a)
+    tx, ty = -math.sin(a), -math.cos(a)   # 切线（沿弧逆时针）
+    nx, ny = -ty, tx                      # 法线
+    p.setBrush(self.color)
+    p.setPen(Qt.NoPen)
+    head = QPainterPath()
+    head.moveTo(QPointF(px + 3.4 * tx, py + 3.4 * ty))
+    head.lineTo(QPointF(px + 2.3 * nx, py + 2.3 * ny))
+    head.lineTo(QPointF(px - 2.3 * nx, py - 2.3 * ny))
+    head.closeSubpath()
+    p.drawPath(head)
 
 
 # 把辅助方法挂到类上，保持 _draw 分支简洁

@@ -2,7 +2,9 @@
 """主窗口：上图下字工具栏、书架主页、三栏写作工作区、设置抽屉与全部功能串联。"""
 from __future__ import annotations
 
+import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -52,6 +54,7 @@ from app.ui.dialogs import (
     NameGeneratorDialog,
     NewBookDialog,
     NoteEditorWindow,
+    ParagraphDialog,
     RelatedDialog,
     StatsDialog,
     WritingThemeDialog,
@@ -288,7 +291,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         add("undo", "撤销", "undo", "撤销（Ctrl+Z）", self.editor_page.undo)
         add("redo", "重做", "redo", "重做（Ctrl+Y）", self.editor_page.redo)
-        add("format", "排版", "format", "智能排版（右键打开排版设置）", self.smart_format)
+        add("format", "排版", "format", "段落排版设置（右键打开排版选项）", self.show_paragraph_dialog)
         self.buttons["format"].setContextMenuPolicy(Qt.CustomContextMenu)
         self.buttons["format"].customContextMenuRequested.connect(
             lambda _pos: self._show_format_menu()
@@ -407,6 +410,13 @@ class MainWindow(QMainWindow):
         self.shelf.export_book_requested.connect(self.export_book)
         self.shelf.cover_change_book_requested.connect(self.change_book_cover)
 
+        # 导入（软件导出的同类型文件）
+        self.shelf.import_book_requested.connect(self.import_book)
+        self.shelf.import_note_requested.connect(self.import_note)
+        self.shelf.import_timeline_requested.connect(self.import_timeline)
+        self.shelf.import_outline_requested.connect(self.import_outline)
+        self.shelf.import_map_requested.connect(self.import_map)
+
         # 成就：成就页右键设置展示勋章
         self.shelf.medal_showcase_requested.connect(self._set_showcase_medal)
 
@@ -421,6 +431,7 @@ class MainWindow(QMainWindow):
         self.sidebar.delete_related_requested.connect(self.delete_related)
 
         self.editor_page.content_edited.connect(self._on_content_edited)
+        self.editor_page.title_edited.connect(self._on_title_edited)
         self.editor_page.chapter_chars_changed.connect(self._on_chapter_chars)
         self.editor_page.speed_delta.connect(self.speed.record)
         # 只有键盘输入的字才计入每日打字统计（粘贴 / 拖放不计）
@@ -431,6 +442,9 @@ class MainWindow(QMainWindow):
         )
         # 时速面板切换单位后立即持久化
         self.editor_page.speed_panel.unit_changed.connect(self._on_speed_unit_changed)
+        # 正文右键：段落设置 / 智能排版
+        self.editor_page.paragraph_settings_requested.connect(self.show_paragraph_dialog)
+        self.editor_page.smart_format_requested.connect(self.smart_format)
 
         self.editor_page.editor.undoAvailable.connect(self.buttons["undo"].setEnabled)
         self.editor_page.editor.redoAvailable.connect(self.buttons["redo"].setEnabled)
@@ -847,6 +861,19 @@ class MainWindow(QMainWindow):
         self.editor_page.set_saved_text(time.strftime("%H:%M"))
         self.editor_page.focus_editor()
 
+    def _on_title_edited(self, title: str) -> None:
+        """双击正文标题改名：与左侧目录重命名走同一套数据流。"""
+        if self.book is None or not self.current_chapter_id:
+            return
+        _volume, chapter = self.book.find_chapter(self.current_chapter_id)
+        if chapter is None or chapter.title == title:
+            return
+        chapter.title = title
+        self.book.touch()
+        self.storage.save_book(self.book, self._total_chars)
+        self.sidebar.set_book(self.book, self.counts, self.current_chapter_id)
+        self.editor_page.set_title(title)
+
     def _on_content_edited(self) -> None:
         self._dirty = True
         self.autosave_timer.start()
@@ -1077,6 +1104,7 @@ class MainWindow(QMainWindow):
             action.setChecked(checked)
             action.toggled.connect(lambda on, k=key: self._set_format_option(k, on))
         menu.addSeparator()
+        menu.addAction("段落设置…", self.show_paragraph_dialog)
         menu.addAction("排版当前章节", self.smart_format)
         menu.addAction("排版整本书", self.format_whole_book)
         menu.exec(QCursor.pos())
@@ -1189,10 +1217,12 @@ class MainWindow(QMainWindow):
             self.settings.font_bold = bold
             self.settings.font_italic = italic
             self.settings.font_underline = underline
-            if color != old[2]:
-                # 文字颜色走全局 QSS（主题变量），需要整体刷新
+            if (color != old[2] or family != old[0] or float(size) != float(old[1])):
+                # 颜色与字体/字号都走全局 QSS（QSS 优先级高于程序字体，
+                # 只调 editor.setFont 会被全局 QWidget 规则覆盖），必须整体刷新
                 self.apply_theme()
             else:
+                # 仅粗体/斜体/下划线变化：编辑器内即可生效
                 self.editor_page.apply_settings(self.settings)
 
         dialog.live_changed.connect(_live)
@@ -1223,6 +1253,22 @@ class MainWindow(QMainWindow):
             self.settings.line_spacing = dialog.value()
             self.storage.save_settings(self.settings)
             self.editor_page.apply_settings(self.settings)
+
+    def show_paragraph_dialog(self) -> None:
+        """段落设置：对齐 / 首行缩进 / 段前段后间距 / 行距（借鉴 Word 段落对话框）。
+
+        字体不在此修改，段落度量基于正文当前字体，自动跟随“字体”设置。
+        """
+        dialog = ParagraphDialog(self, self.settings)
+        if dialog.exec() != ParagraphDialog.Accepted:
+            return
+        (self.settings.para_align,
+         self.settings.para_indent,
+         self.settings.para_space_before,
+         self.settings.para_space_after,
+         self.settings.line_spacing) = dialog.values()
+        self.storage.save_settings(self.settings)
+        self.editor_page.apply_settings(self.settings)
 
     def show_writing_theme(self) -> None:
         """写作主题面板：圆形色块实时切换写作区背景。"""
@@ -1521,6 +1567,120 @@ class MainWindow(QMainWindow):
             MessageBox.warning(self, "导出失败", f"无法写入文件：{exc}")
             return
         MessageBox.information(self, "导出成功", f"已导出到：\n{path}")
+
+    # ==================================================================
+    # 导入（兼容本软件历史版本 / 当前版本导出的同类型文件）
+    # ==================================================================
+    def _pick_open_file(self, title: str, name_filter: str) -> str:
+        path, _f = QFileDialog.getOpenFileName(self, title, "", name_filter)
+        return path
+
+    def import_book(self) -> None:
+        """导入小说 TXT（本软件导出格式，普通 TXT 按章节标记尽力拆章）。"""
+        from app.models import Book, Chapter, Volume
+        from app.services import importer
+
+        path = self._pick_open_file("导入小说", "文本文档 (*.txt);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            text = importer.read_text_file(path)
+        except OSError as exc:
+            MessageBox.warning(self, "导入失败", f"无法读取文件：{exc}")
+            return
+        parsed = importer.parse_novel_txt(text)
+        now = time.time()
+        book = Book(
+            id=new_id(),
+            title=parsed["title"],
+            author=parsed["author"],
+            cover_index=random.randint(0, 5),
+            created_at=now,
+            updated_at=now,
+        )
+        for vol_data in parsed["volumes"]:
+            volume = Volume(id=new_id(), title=vol_data["title"])
+            for ch_data in vol_data["chapters"]:
+                volume.chapters.append(
+                    Chapter(id=new_id(), title=ch_data["title"], content=ch_data["content"])
+                )
+            book.volumes.append(volume)
+        first = book.first_chapter()
+        book.last_chapter_id = first.id if first is not None else ""
+        self.storage.save_book(book)
+        self._update_shelf()
+        self._unlock_achievement("first_book")   # 卧龙出山：创立第一本书
+        MessageBox.information(
+            self, "导入成功", f"《{book.title}》已导入书架，共 {book.chapter_count()} 章。"
+        )
+
+    def import_note(self) -> None:
+        """导入设定 TXT（首行标题、空行、正文）。"""
+        from app.services import importer
+
+        path = self._pick_open_file("导入设定", "文本文档 (*.txt);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            text = importer.read_text_file(path)
+        except OSError as exc:
+            MessageBox.warning(self, "导入失败", f"无法读取文件：{exc}")
+            return
+        parsed = importer.parse_note_txt(text)
+        doc = self.storage.import_note_doc(parsed["title"], parsed["content"])
+        self._update_shelf()
+        MessageBox.information(self, "导入成功", f"设定「{doc['title']}」已导入。")
+
+    def import_timeline(self) -> None:
+        """导入时间轴 JSON（本软件导出格式）。"""
+        path = self._pick_open_file("导入时间轴", "JSON 文件 (*.json);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            MessageBox.warning(self, "导入失败", f"无法读取文件：{exc}")
+            return
+        if not (isinstance(data, dict) and isinstance(data.get("events"), list)):
+            MessageBox.warning(self, "导入失败", "这不是本软件导出的时间轴文件。")
+            return
+        item = self.storage.import_timeline(data)
+        self._update_shelf()
+        MessageBox.information(self, "导入成功", f"时间轴「{item['title']}」已导入。")
+
+    def import_outline(self) -> None:
+        """导入大纲 JSON（本软件导出格式）。"""
+        path = self._pick_open_file("导入大纲", "JSON 文件 (*.json);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            MessageBox.warning(self, "导入失败", f"无法读取文件：{exc}")
+            return
+        if not (isinstance(data, dict) and isinstance(data.get("nodes"), list)):
+            MessageBox.warning(self, "导入失败", "这不是本软件导出的大纲文件。")
+            return
+        item = self.storage.import_outline(data)
+        self._update_shelf()
+        MessageBox.information(self, "导入成功", f"大纲「{item['title']}」已导入。")
+
+    def import_map(self) -> None:
+        """导入地图底图图片（导出的 PNG / 普通图片，作为新地图底图）。"""
+        path = self._pick_open_file(
+            "导入地图底图", "图片文件 (*.png *.jpg *.jpeg *.webp *.bmp);;所有文件 (*)"
+        )
+        if not path:
+            return
+        try:
+            item = self.storage.import_map_image(path)
+        except OSError as exc:
+            MessageBox.warning(self, "导入失败", f"无法读取文件：{exc}")
+            return
+        self._update_shelf()
+        MessageBox.information(self, "导入成功", f"地图「{item['title']}」已导入，可继续在底图上标注。")
 
     # ==================================================================
     # 默认保存（数据）路径
@@ -1851,9 +2011,12 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self.drawer.relayout()
 
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def closeEvent(self, event) -> None:
+        # 关闭软件前把未落盘的内容全部保存一次
+        self.autosave_timer.stop()
+        self.save_current_book()
+        self.flush()
         self.words_timer.stop()
         self._flush_words()
-        self.flush()
         self.storage.save_settings(self.settings)
         super().closeEvent(event)

@@ -28,17 +28,25 @@ def is_punctuation(ch: str) -> bool:
         return False
 
 
+# 字符是否计数的缓存：小说用字高度重复，缓存后接近 C 速度
+_KEEP_CACHE: dict[str, bool] = {}
+
+
 def count_chars(text: str, exclude_punctuation: bool = False) -> int:
     """统计字数。空白不计，可选排除标点。"""
     if not text:
         return 0
+    if not exclude_punctuation:
+        return sum(1 for ch in text if not ch.isspace())
+    cache = _KEEP_CACHE
     count = 0
     for ch in text:
-        if ch.isspace():
-            continue
-        if exclude_punctuation and is_punctuation(ch):
-            continue
-        count += 1
+        keep = cache.get(ch)
+        if keep is None:
+            keep = not (ch.isspace() or is_punctuation(ch))
+            cache[ch] = keep
+        if keep:
+            count += 1
     return count
 
 

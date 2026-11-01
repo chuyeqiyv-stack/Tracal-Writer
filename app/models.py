@@ -100,6 +100,11 @@ class Settings:
     font_italic: bool = False                # 斜体
     font_underline: bool = False             # 下划线
     line_spacing: float = 1.8
+    # 段落排版（“排版”按钮 / 正文右键“段落设置”，借鉴 Word 段落对话框）
+    para_align: str = "left"            # left / center / right
+    para_indent: int = 0                # 首行缩进字符数（0-8；智能排版已插全角空格时保持 0）
+    para_space_before: float = 0.0      # 段前间距（行）
+    para_space_after: float = 0.0       # 段后间距（行）
     imported_fonts: list[str] = field(default_factory=list)
 
     # 书架
@@ -163,6 +168,11 @@ class Settings:
             setattr(result, name, _clean_color(getattr(result, name)))
         result.font_size = max(5.0, min(72.0, float(result.font_size)))
         result.line_spacing = max(1.0, min(3.5, result.line_spacing))
+        if result.para_align not in {"left", "center", "right"}:
+            result.para_align = "left"
+        result.para_indent = max(0, min(8, int(result.para_indent)))
+        result.para_space_before = max(0.0, min(4.0, float(result.para_space_before)))
+        result.para_space_after = max(0.0, min(4.0, float(result.para_space_after)))
         if not result.nickname.strip():
             result.nickname = "写作者"
         return result

@@ -2,11 +2,14 @@
 """正文编辑区：章节标题、编辑器、状态栏、悬浮快捷控件。"""
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QKeySequence,
+    QPainter,
     QPalette,
+    QPen,
     QPixmap,
     QTextBlockFormat,
     QTextCharFormat,
@@ -17,6 +20,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QSizePolicy,
     QTextEdit,
     QToolButton,
@@ -92,10 +96,69 @@ class NovelEditor(QTextEdit):
         # 写作页用鼠标滚轮上下滑动；不显示滚动条滑块
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setCursorWidth(2)
+        self.setCursorWidth(1)
         self.setTabChangesFocus(False)
         self.setPlaceholderText("从这里开始你的故事……")
         self.document().setDocumentMargin(6)
+        # 段间空行（空段落）压缩为矮行，视觉段距更接近主流写作软件
+        self._compacting = False
+        self.document().contentsChange.connect(self._on_contents_change_compact)
+
+    # ------------------------------------------------------------------
+    def _on_contents_change_compact(self, pos: int, _removed: int, _added: int) -> None:
+        """改动波及的空段落压缩高度；非空段落恢复正常行高。"""
+        if self._compacting:
+            return
+        block = self.document().findBlock(pos)
+        for _ in range(3):
+            if not block.isValid():
+                break
+            self._apply_compact(block)
+            block = block.next()
+
+    def _apply_compact(self, block) -> None:
+        empty = not block.text().strip()
+        bfmt = block.blockFormat()
+        fixed = QTextBlockFormat.LineHeightTypes.FixedHeight.value
+        is_fixed = bfmt.lineHeightType() == fixed
+        # 全文仅剩一个空段时不压缩（若已压缩则恢复）：
+        # 占位提示文字画在该段落上，矮行会把它裁掉
+        if self.document().blockCount() == 1 and empty:
+            if is_fixed:
+                restore = QTextBlockFormat()
+                restore.setLineHeight(0, QTextBlockFormat.LineHeightTypes.SingleHeight.value)
+                self._compacting = True
+                QTextCursor(block).mergeBlockFormat(restore)
+                self._compacting = False
+            return
+        if empty and not is_fixed:
+            compact = QTextBlockFormat(bfmt)
+            compact.setLineHeight(self._compact_height(), fixed)
+            self._compacting = True
+            QTextCursor(block).mergeBlockFormat(compact)
+            self._compacting = False
+        elif not empty and is_fixed:
+            restore = QTextBlockFormat()
+            restore.setLineHeight(0, QTextBlockFormat.LineHeightTypes.SingleHeight.value)
+            self._compacting = True
+            QTextCursor(block).mergeBlockFormat(restore)
+            self._compacting = False
+
+    def _compact_height(self) -> float:
+        return max(6.0, round(self.fontMetrics().height() * 0.4))
+
+    def compact_all_empty_blocks(self) -> None:
+        """整篇压缩（载入章节后调用）。"""
+        if self._compacting:
+            return
+        self._compacting = True
+        try:
+            block = self.document().firstBlock()
+            while block.isValid():
+                self._apply_compact(block)
+                block = block.next()
+        finally:
+            self._compacting = False
 
     def insertFromMimeData(self, source) -> None:  # noqa: N802
         """粘贴 / 拖放插入：标记后不计入“键盘打字”统计。"""
@@ -185,13 +248,38 @@ class SpeedPanel(QFrame):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(8)
 
-        # 标题行：标题 + 单位切换 + 刷新 + 隐藏
+        # 标题行：码字时速 + 帮助提示 …… 右侧关闭（参考竞品布局）
         header = QHBoxLayout()
         header.setSpacing(4)
         title = QLabel("码字时速", self)
         title.setObjectName("SidePanelTitle")
         header.addWidget(title)
+        help_button = QToolButton(self)
+        help_button.setObjectName("SidePanelHelp")
+        help_button.setText("?")
+        help_button.setCursor(Qt.PointingHandCursor)
+        help_button.setToolTip(
+            "实时统计本次码字数据：字数、速度、时长与空闲。\n"
+            "停写 30 秒后开始记录空闲；打字即停，不清零。"
+        )
+        header.addWidget(help_button)
         header.addStretch(1)
+        hide_button = QToolButton(self)
+        hide_button.setObjectName("DrawerClose")
+        hide_button.setText("×")
+        hide_button.setCursor(Qt.PointingHandCursor)
+        hide_button.setToolTip("隐藏时速面板")
+        hide_button.clicked.connect(self.hide_requested.emit)
+        header.addWidget(hide_button)
+        layout.addLayout(header)
+
+        # 第二行：状态（左）…… 单位切换 + 刷新（右）
+        status_row = QHBoxLayout()
+        status_row.setSpacing(6)
+        self.status_label = QLabel("未开始", self)
+        self.status_label.setObjectName("SidePanelStatus")
+        status_row.addWidget(self.status_label)
+        status_row.addStretch(1)
         # 单位拨动开关：胶囊底槽 + 滑动圆钮，字/分 ↔ 字/时（带平滑滑动动画）
         unit_widget = QWidget(self)
         unit_row = QHBoxLayout(unit_widget)
@@ -218,45 +306,28 @@ class SpeedPanel(QFrame):
         self.unit_hour_label.setToolTip("按每小时多少字显示码字速度")
         self.unit_hour_label.clicked.connect(lambda: self._set_unit("per_hour"))
         unit_row.addWidget(self.unit_hour_label)
-        header.addWidget(unit_widget)
+        status_row.addWidget(unit_widget)
         refresh_button = QToolButton(self)
         refresh_button.setObjectName("PanelToolButton")
         refresh_button.setText("⟳")
         refresh_button.setCursor(Qt.PointingHandCursor)
         refresh_button.setToolTip("立即刷新")
         refresh_button.clicked.connect(self.refresh)
-        header.addWidget(refresh_button)
-        hide_button = QToolButton(self)
-        hide_button.setObjectName("DrawerClose")
-        hide_button.setText("»")
-        hide_button.setCursor(Qt.PointingHandCursor)
-        hide_button.setToolTip("隐藏时速面板")
-        hide_button.clicked.connect(self.hide_requested.emit)
-        header.addWidget(hide_button)
-        layout.addLayout(header)
-
-        # 数据块整体垂直居中：上下各留弹性间距
-        layout.addStretch(2)
-
-        # 状态行（未开始 / 计时中 / 已暂停）
-        self.status_label = QLabel("未开始", self)
-        self.status_label.setObjectName("SidePanelStatus")
-        self.status_label.setAlignment(Qt.AlignHCenter)
-        layout.addWidget(self.status_label)
+        status_row.addWidget(refresh_button)
+        layout.addLayout(status_row)
         layout.addSpacing(6)
 
-        # 四个数据行：左标签右数值
+        # 四个数据行：浅灰圆角卡片，左灰标签右加粗数值
         self.session_value = self._add_row(layout, "本次字数")
         self.speed_value = self._add_row(layout, "码字速度")
         self.time_value = self._add_row(layout, "码字时长")
         self.idle_value = self._add_row(layout, "空闲时长")
 
-        layout.addStretch(3)
+        layout.addStretch(1)
 
         hint = QLabel("停写 30 秒后开始记录空闲；打字即停，不清零。", self)
         hint.setObjectName("SidePanelKey")
         hint.setWordWrap(True)
-        hint.setAlignment(Qt.AlignHCenter)
         layout.addWidget(hint)
 
         self._timer = QTimer(self)
@@ -285,9 +356,9 @@ class SpeedPanel(QFrame):
     # ------------------------------------------------------------------
     def _add_row(self, layout: QVBoxLayout, key: str) -> QLabel:
         row = QFrame(self)
-        row.setObjectName("SidePanelRow")
+        row.setObjectName("SideCard")
         row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(2, 0, 2, 0)
+        row_layout.setContentsMargins(10, 6, 10, 6)
         label = QLabel(key, row)
         label.setObjectName("SidePanelKey")
         value = QLabel("—", row)
@@ -394,6 +465,62 @@ class SpeedPanel(QFrame):
         super().hideEvent(event)
 
 
+class SaveSpinner(QWidget):
+    """保存指示器：白色半透明圆环内一段深色弧旋转（左下角）。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(30, 30)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._angle = 0
+        self._spin = QTimer(self)
+        self._spin.setInterval(33)
+        self._spin.timeout.connect(self._tick)
+        self._fade = QTimer(self)
+        self._fade.setSingleShot(True)
+        self._fade.timeout.connect(self.hide)
+        self.hide()
+
+    def flash(self, ms: int = 600) -> None:
+        self._fade.start(ms)
+        if not self._spin.isActive():
+            self._spin.start()
+        self.show()
+        self.raise_()
+        self.update()
+
+    def _tick(self) -> None:
+        self._angle = (self._angle + 12) % 360
+        self.update()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._spin.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(4, 4, 22, 22)
+        pen = QPen(QColor(255, 255, 255, 205), 3.0)
+        painter.setPen(pen)
+        painter.drawEllipse(rect)                       # 白色半透明圆环
+        pen.setColor(QColor(24, 26, 30, 200))
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(rect, self._angle * 16, 100 * 16)  # 旋转的深色弧段
+
+
+class TitleLabel(QLabel):
+    """章节标题：双击进入行内编辑（与左侧目录重命名形成“双通道”）。"""
+
+    double_clicked = Signal()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.double_clicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+
 class EditorPage(QWidget):
     """完整的正文页面。"""
 
@@ -402,6 +529,9 @@ class EditorPage(QWidget):
     speed_delta = Signal(int)
     typed_delta = Signal(int)          # 仅键盘输入的新增字数（粘贴不计）
     speed_panel_toggled = Signal(bool)  # 右侧时速面板显隐变化
+    title_edited = Signal(str)         # 双击标题后提交的新章节名
+    paragraph_settings_requested = Signal()  # 正文右键 / 顶栏请求打开段落设置
+    smart_format_requested = Signal()        # 正文右键请求智能排版
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
@@ -411,6 +541,13 @@ class EditorPage(QWidget):
         self._total_chars = 0
         self._applied_font: tuple[str, str, float] | None = None
         self._applied_spacing: float | None = None
+        self._applied_para: tuple | None = None
+        # 字数统计防抖定时器（流畅度：打字时不做全文统计）
+        self._pending_keyboard = False
+        self._count_timer = QTimer(self)
+        self._count_timer.setSingleShot(True)
+        self._count_timer.setInterval(120)
+        self._count_timer.timeout.connect(self._recount)
 
         self._build_ui()
         self._connect()
@@ -443,17 +580,32 @@ class EditorPage(QWidget):
         paper_layout.setContentsMargins(0, 30, 0, 30)
         paper_layout.setSpacing(30)
 
-        self.title_label = QLabel("未选择章节", self)
+        self.title_label = TitleLabel("未选择章节", self)
         self.title_label.setObjectName("EditorTitle")
         self.title_label.setAlignment(Qt.AlignCenter)
         self.title_label.setMinimumHeight(34)
+        self.title_label.setToolTip("双击可直接修改章节名")
+        self.title_label.double_clicked.connect(self.begin_title_edit)
         paper_layout.addWidget(self.title_label)
+
+        # 标题“双通道”编辑：双击正文标题时显示的行内输入框
+        self.title_edit = QLineEdit(paper)
+        self.title_edit.setObjectName("EditorTitleEdit")
+        self.title_edit.setAlignment(Qt.AlignCenter)
+        self.title_edit.hide()
+        self.title_edit.returnPressed.connect(self._commit_title_edit)
+        self.title_edit.editingFinished.connect(self._commit_title_edit)
+        self.title_edit.installEventFilter(self)
+        paper_layout.addWidget(self.title_edit)
 
         self.editor = NovelEditor(paper)
         paper_layout.addWidget(self.editor, 1)
 
         outer.addWidget(paper, 1)
         self.paper = paper
+
+        # 保存指示器：左下角转圈动画（0.6 秒自动消失）
+        self.save_spinner = SaveSpinner(self)
 
         # 状态栏：字数统计在最左下角，其后是光标位置，保存提示靠右
         status_row = QHBoxLayout()
@@ -504,6 +656,16 @@ class EditorPage(QWidget):
         self.editor.textChanged.connect(self._on_text_changed)
         self.editor.cursorPositionChanged.connect(self._update_cursor_label)
         # 滚轮监听由 ScrollFlasher 自行挂在编辑器视口上
+        # 正文右键菜单：标准编辑菜单 + 段落设置 / 智能排版
+        self.editor.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.editor.customContextMenuRequested.connect(self._show_editor_menu)
+
+    def _show_editor_menu(self, pos) -> None:
+        menu = self.editor.createStandardContextMenu()
+        menu.addSeparator()
+        menu.addAction("段落设置…", lambda: self.paragraph_settings_requested.emit())
+        menu.addAction("智能排版（本章）", lambda: self.smart_format_requested.emit())
+        menu.exec(self.editor.viewport().mapToGlobal(pos))
 
     # ------------------------------------------------------------------
     # 对外接口
@@ -514,9 +676,16 @@ class EditorPage(QWidget):
         try:
             self.title_label.setText(title)
             self.editor.setExtraSelections([])
-            self.editor.setPlainText(text)
+            # 先把字体应用到控件，setPlainText 才会把正确字体“烘焙”进文本，
+            # 从而无需载入后再做全文重排版（长章节全文 merge 会明显卡顿）
             self._applied_font = None
             self._applied_spacing = None
+            self._applied_para = None
+            self._apply_typography()
+            self.editor.setPlainText(text)
+            self.editor.compact_all_empty_blocks()
+            # 载入的新文本块是默认段落格式，套用段落排版（对齐/缩进/段距）
+            self._applied_para = None
             self._apply_typography()
 
             cursor = self.editor.textCursor()
@@ -554,12 +723,50 @@ class EditorPage(QWidget):
     def set_title(self, title: str) -> None:
         self.title_label.setText(title)
 
+    # ------------------------------------------------------------------
+    # 标题行内编辑（双通道之一）
+    # ------------------------------------------------------------------
+    def begin_title_edit(self) -> None:
+        """双击标题：显示行内输入框，回车提交，Esc 取消。"""
+        title = self.title_label.text()
+        if not title or title == "未选择章节":
+            return
+        self.title_edit.setText(title)
+        self.title_label.hide()
+        self.title_edit.show()
+        self.title_edit.setFocus()
+        self.title_edit.selectAll()
+
+    def _commit_title_edit(self) -> None:
+        if self.title_edit.isHidden():
+            return
+        text = self.title_edit.text().strip()
+        self.title_edit.hide()
+        self.title_label.show()
+        if text and text != self.title_label.text():
+            self.title_edited.emit(text)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.title_edit and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Escape:
+                self.title_edit.hide()
+                self.title_label.show()
+                return True
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self._commit_title_edit()
+                self.focus_editor()
+                return True
+        return super().eventFilter(obj, event)
+
     def set_total_chars(self, total: int) -> None:
         self._total_chars = max(0, total)
         self._update_status()
 
     def set_saved_text(self, minute: str = "") -> None:
         self.save_label.setText(f"已自动保存 {minute}" if minute else "")
+        if minute:
+            # 左下角转圈 0.6 秒提示保存成功
+            self.save_spinner.flash()
 
     def focus_editor(self) -> None:
         self.editor.setFocus()
@@ -622,13 +829,11 @@ class EditorPage(QWidget):
             font.setUnderline(bool(self.settings.font_underline))
             self.editor.setFont(font)
             self.editor.document().setDefaultFont(font)
-            # setPlainText 会把控件当时的字体“烘焙”成显式字符格式，覆盖用户设置；
-            # 这里把用户字体合并到全文，保证排版/载入后字体始终跟随设置
-            cursor = QTextCursor(self.editor.document())
-            cursor.select(QTextCursor.Document)
+            # 只合并到“当前字符格式”（影响后续输入的字体）。
+            # 不要对全文 mergeCharFormat：长章节会触发整篇重排版造成卡顿；
+            # 载入路径已在 setPlainText 前设置好控件字体，烘焙格式即为用户字体
             char_format = QTextCharFormat()
             char_format.setFont(font)
-            cursor.mergeCharFormat(char_format)
             self.editor.mergeCurrentCharFormat(char_format)
             self._applied_font = font_key
             # 立即重绘视口，字体变化马上可见
@@ -638,6 +843,52 @@ class EditorPage(QWidget):
         if spacing_key != self._applied_spacing:
             self._apply_line_spacing()
             self._applied_spacing = spacing_key
+
+        para_key = (
+            self.settings.para_align,
+            int(self.settings.para_indent),
+            round(float(self.settings.para_space_before), 2),
+            round(float(self.settings.para_space_after), 2),
+        )
+        if para_key != self._applied_para:
+            self._apply_paragraph_format()
+            self._applied_para = para_key
+
+    def _apply_paragraph_format(self) -> None:
+        """给全文段落套用排版（对齐 / 首行缩进 / 段前段后间距）。
+
+        度量全部基于正文当前字体（fontMetrics），因此自动跟随“字体”设置。
+        """
+        document = self.editor.document()
+        bar = self.editor.verticalScrollBar()
+        old_value = bar.value()
+
+        was_loading = self._loading
+        self._loading = True
+        document.setUndoRedoEnabled(False)
+        try:
+            fm = self.editor.fontMetrics()
+            align = {
+                "left": Qt.AlignLeft,
+                "center": Qt.AlignHCenter,
+                "right": Qt.AlignRight,
+            }.get(self.settings.para_align, Qt.AlignLeft)
+            indent_px = float(fm.horizontalAdvance("字") * max(0, int(self.settings.para_indent)))
+            line_h = float(fm.height())
+            block = document.firstBlock()
+            while block.isValid():
+                bfmt = QTextBlockFormat(block.blockFormat())
+                bfmt.setAlignment(align)
+                bfmt.setTextIndent(indent_px)
+                bfmt.setTopMargin(line_h * max(0.0, float(self.settings.para_space_before)))
+                bfmt.setBottomMargin(line_h * max(0.0, float(self.settings.para_space_after)))
+                QTextCursor(block).mergeBlockFormat(bfmt)
+                block = block.next()
+        finally:
+            document.setUndoRedoEnabled(True)
+            self._loading = was_loading
+
+        bar.setValue(min(old_value, bar.maximum()))
 
     def apply_writing_background(self) -> None:
         """根据设置应用写作区背景：预设色块走 QSS，自定义图片走自绘。"""
@@ -666,6 +917,8 @@ class EditorPage(QWidget):
             cursor.select(QTextCursor.Document)
             cursor.mergeBlockFormat(block_format)
             document.setUndoRedoEnabled(True)
+            # 全文行距覆盖会把空段落的“矮行”一并冲掉，这里重新压缩
+            self.editor.compact_all_empty_blocks()
         finally:
             self._loading = was_loading
 
@@ -680,24 +933,28 @@ class EditorPage(QWidget):
         # 文本变化后旧的查找高亮已经失效，直接清除
         if self.editor.extraSelections():
             self.editor.setExtraSelections([])
+        # 只有键盘敲出来的字才计入码字速度与每日打字统计（粘贴 / 拖放不计）
+        if not getattr(self.editor, "_paste_insert", False):
+            self._pending_keyboard = True
+        # 字数统计防抖：避免每个按键都全文 toPlainText + 逐字统计（长章节卡顿）
+        self._count_timer.start()
+        self.content_edited.emit()
 
+    def _recount(self) -> None:
+        """防抖后的字数重算（120ms 静止后执行一次）。"""
         text = self.editor.toPlainText()
         count = count_chars(text, self.settings.exclude_punct)
         delta = count - self._last_count
         self._last_count = count
-
-        if delta > 0:
-            # 只有键盘敲出来的字才计入码字速度与每日打字统计；粘贴 / 拖放不计
-            if not getattr(self.editor, "_paste_insert", False):
-                self.speed_delta.emit(delta)
-                self.typed_delta.emit(delta)
-                # 打字后尽快刷新时速面板（面板可见时），不必等 1 秒定时器
-                if self.speed_panel.isVisible():
-                    self.speed_panel.notify_activity()
-
+        if delta > 0 and self._pending_keyboard:
+            self.speed_delta.emit(delta)
+            self.typed_delta.emit(delta)
+            # 打字后尽快刷新时速面板（面板可见时），不必等 1 秒定时器
+            if self.speed_panel.isVisible():
+                self.speed_panel.notify_activity()
+        self._pending_keyboard = False
         self.chapter_chars_changed.emit(count)
         self._update_status()
-        self.content_edited.emit()
 
     def _update_cursor_label(self) -> None:
         cursor = self.editor.textCursor()
@@ -726,6 +983,8 @@ class EditorPage(QWidget):
     def _position_floating(self) -> None:
         width = self.width()
         height = self.height()
+        # 左下角保存指示器：贴左、往上避开状态栏
+        self.save_spinner.move(14, height - 64)
         # 右侧时速面板可见时，悬浮控件向左避让
         offset = self.speed_panel.width() + 14 if self.speed_panel.isVisible() else 0
         self.jump_bottom.move(width - offset - 58, height - 72)

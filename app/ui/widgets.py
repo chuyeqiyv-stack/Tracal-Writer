@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.ui.theme import COVER_GRADIENTS
+from app.ui.theme import COVER_GRADIENTS, qc
 
 _DEFAULT_COVER: QPixmap | None = None
 _DEFAULT_COVER_LOADED = False
@@ -213,7 +213,7 @@ class ToolbarButton(QAbstractButton):
 
         hover = self._progress
         if self.isChecked() or hover > 0.01:
-            bg = QColor(theme["accent_soft"] if self.isChecked() else theme["hover"])
+            bg = qc(theme["accent_soft"] if self.isChecked() else theme["hover"])
             bg.setAlphaF(0.65 + 0.35 * hover if not self.isChecked() else 1.0)
             painter.setPen(Qt.NoPen)
             painter.setBrush(bg)
@@ -802,16 +802,21 @@ class ToastLabel(QLabel):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.hide)
 
-    def show_message(self, text: str) -> None:
+    def show_message(self, text: str, ms: int = 1400, center: bool = False) -> None:
+        """显示轻提示。center=True 时显示在父控件垂直居中位置（保存提示等）。"""
         self.setText(text)
         self.adjustSize()
         parent = self.parentWidget()
         if parent is not None:
             x = (parent.width() - self.width()) // 2
-            self.move(max(8, x), 16)
+            if center:
+                y = (parent.height() - self.height()) // 2
+            else:
+                y = 16
+            self.move(max(8, x), max(8, y))
         self.raise_()
         self.show()
-        self._timer.start(1400)
+        self._timer.start(ms)
 
 
 def apply_shadow(widget: QWidget, blur: int = 18, alpha: int = 26, dy: int = 4) -> None:

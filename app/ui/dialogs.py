@@ -5,13 +5,14 @@ from __future__ import annotations
 import os
 import time
 
-from PySide6.QtCore import QDate, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QDate, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -613,6 +614,112 @@ class LineSpacingDialog(QDialog):
         return round(self.slider.value() / 100, 2)
 
 
+class ParagraphDialog(QDialog):
+    """段落设置（借鉴 Word 段落对话框）：对齐方式、首行缩进、段前/段后间距与行距。
+
+    字体不在此设置——段落格式一律基于正文当前字体计算，自动跟随“字体”设置。
+    """
+
+    ALIGN_LABELS = [("left", "左对齐"), ("center", "居中"), ("right", "右对齐")]
+
+    def __init__(self, parent, settings) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("段落设置")
+        self.setModal(True)
+        self.resize(420, 330)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 18)
+        layout.setSpacing(12)
+
+        def group_title(text: str) -> QLabel:
+            label = QLabel(text, self)
+            label.setObjectName("DrawerTitle")
+            return label
+
+        # ---- 常规：对齐方式 ----
+        layout.addWidget(group_title("常规"))
+        align_row = QHBoxLayout()
+        align_row.addWidget(QLabel("对齐方式：", self))
+        self.align_combo = QComboBox(self)
+        for _key, label in self.ALIGN_LABELS:
+            self.align_combo.addItem(label)
+        keys = [key for key, _ in self.ALIGN_LABELS]
+        self.align_combo.setCurrentIndex(
+            keys.index(settings.para_align) if settings.para_align in keys else 0
+        )
+        align_row.addWidget(self.align_combo, 1)
+        layout.addLayout(align_row)
+
+        # ---- 缩进：首行 ----
+        layout.addWidget(group_title("缩进"))
+        indent_row = QHBoxLayout()
+        indent_row.addWidget(QLabel("首行：", self))
+        self.indent_spin = QDoubleSpinBox(self)
+        self.indent_spin.setRange(0, 8)
+        self.indent_spin.setDecimals(0)
+        self.indent_spin.setSingleStep(1)
+        self.indent_spin.setSuffix(" 字符")
+        self.indent_spin.setValue(float(settings.para_indent))
+        indent_row.addWidget(self.indent_spin)
+        indent_row.addStretch(1)
+        indent_hint = QLabel("正文已有全角空格缩进时请保持 0，避免双重缩进", self)
+        indent_hint.setObjectName("DrawerHint")
+        indent_row.addWidget(indent_hint, 1)
+        layout.addLayout(indent_row)
+
+        # ---- 间距：段前 / 段后 / 行距 ----
+        layout.addWidget(group_title("间距"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        grid.addWidget(QLabel("段前：", self), 0, 0)
+        self.before_spin = QDoubleSpinBox(self)
+        self.before_spin.setRange(0.0, 4.0)
+        self.before_spin.setSingleStep(0.5)
+        self.before_spin.setDecimals(1)
+        self.before_spin.setSuffix(" 行")
+        self.before_spin.setValue(float(settings.para_space_before))
+        grid.addWidget(self.before_spin, 0, 1)
+        grid.addWidget(QLabel("段后：", self), 0, 2)
+        self.after_spin = QDoubleSpinBox(self)
+        self.after_spin.setRange(0.0, 4.0)
+        self.after_spin.setSingleStep(0.5)
+        self.after_spin.setDecimals(1)
+        self.after_spin.setSuffix(" 行")
+        self.after_spin.setValue(float(settings.para_space_after))
+        grid.addWidget(self.after_spin, 0, 3)
+        grid.addWidget(QLabel("行距：", self), 1, 0)
+        self.spacing_spin = QDoubleSpinBox(self)
+        self.spacing_spin.setRange(1.0, 3.5)
+        self.spacing_spin.setSingleStep(0.05)
+        self.spacing_spin.setDecimals(2)
+        self.spacing_spin.setSuffix(" 倍")
+        self.spacing_spin.setValue(float(settings.line_spacing))
+        grid.addWidget(self.spacing_spin, 1, 1)
+        grid.setColumnStretch(4, 1)
+        layout.addLayout(grid)
+
+        sample = QLabel("段落格式基于正文当前字体即时计算，自动跟随“字体”设置。", self)
+        sample.setObjectName("DrawerHint")
+        sample.setWordWrap(True)
+        layout.addWidget(sample)
+        layout.addStretch(1)
+
+        _add_buttons(self, layout, "确定", self.accept)
+
+    def values(self) -> tuple[str, int, float, float, float]:
+        keys = [key for key, _ in self.ALIGN_LABELS]
+        align = keys[self.align_combo.currentIndex()] if self.align_combo.currentIndex() >= 0 else "left"
+        return (
+            align,
+            int(self.indent_spin.value()),
+            round(self.before_spin.value(), 2),
+            round(self.after_spin.value(), 2),
+            round(self.spacing_spin.value(), 2),
+        )
+
+
 class FindReplaceDialog(QDialog):
     """查找替换小窗，支持当前章节与全书。"""
 
@@ -939,131 +1046,164 @@ class HistoryDialog(QDialog):
 
 
 class NameGeneratorDialog(QDialog):
-    """起名助手：左 40% 筛选，右 60% 结果（3 列网格，点击复制）。"""
+    """起名助手：顶部 7 类页签，左侧子类型筛选 + 后缀 + 生成按钮，
+    右侧名称胶囊墙（点击复制）。整体为圆角卡片，标题栏可拖动。"""
 
-    KIND_TABS = ["人物", "地点"]
-    STYLE_KEYS = [("cn", "中文"), ("west", "西方"), ("jp", "日式")]
-    GENDER_KEYS = [("any", "不限"), ("male", "男"), ("female", "女")]
+    TABS = [
+        ("person", "人物"), ("place", "地点"), ("faction", "势力"),
+        ("equip", "装备"), ("skill", "功法"), ("monster", "怪兽"),
+        ("other", "其他"),
+    ]
+    SUBTYPES = {
+        "person": [("any", "不限"), ("male", "男"), ("female", "女")],
+        "place": [("east", "东方"), ("west", "西方"), ("jp", "日式")],
+        "faction": [("right", "正道"), ("evil", "魔道"), ("neutral", "中立")],
+        "equip": [("weapon", "武器"), ("armor", "防具"), ("accessory", "饰品")],
+        "skill": [("sword", "剑诀"), ("palm", "掌法"), ("mind", "心法"), ("move", "身法")],
+        "monster": [("yao", "妖兽"), ("ling", "灵兽"), ("xiong", "凶兽")],
+        "other": [("pill", "丹药"), ("title", "称号"), ("item", "灵物")],
+    }
+    STYLES = [("cn", "中文"), ("west", "西方"), ("jp", "日式")]
+    COLUMNS = 4
+    COUNT = 24
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("起名助手")
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setModal(True)
-        self.resize(860, 560)
+        self.resize(880, 600)
         self._kind = "person"
+        self._subtype = "any"
+        self._style = "cn"
+        self._drag_pos: QPoint | None = None
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 28, 28, 28)   # 给阴影留出空间
 
-        # ============ 左侧筛选区（40%） ============
-        left_frame = QFrame(self)
-        left_frame.setObjectName("NameGenFilter")
-        left_frame.setFixedWidth(int(860 * 0.40))
-        left = QVBoxLayout(left_frame)
-        left.setContentsMargins(20, 20, 20, 20)
-        left.setSpacing(14)
+        card = QFrame(self)
+        card.setObjectName("MessageBox")
+        effect = QGraphicsDropShadowEffect(card)
+        effect.setBlurRadius(36)
+        effect.setOffset(0, 10)
+        effect.setColor(QColor(24, 26, 32, 70))
+        card.setGraphicsEffect(effect)
+        outer.addWidget(card)
 
-        title = QLabel("起名助手", left_frame)
-        title.setObjectName("NameGenTitle")
-        left.addWidget(title)
+        root = QVBoxLayout(card)
+        root.setContentsMargins(22, 16, 18, 18)
+        root.setSpacing(12)
 
-        # 类型 Tab：人物 / 地点
+        # ---- 头部：标题居中 + 右上关闭 ----
+        head = QHBoxLayout()
+        head.addStretch(1)
+        title = QLabel("起名助手", card)
+        title.setObjectName("MsgTitle")
+        head.addWidget(title)
+        head.addStretch(1)
+        close_button = _ghost("×", card)
+        close_button.setFixedSize(30, 30)
+        close_button.setToolTip("关闭")
+        close_button.clicked.connect(self.reject)
+        head.addWidget(close_button)
+        root.addLayout(head)
+
+        # ---- 页签行：7 大类 ----
         tab_row = QHBoxLayout()
-        tab_row.setSpacing(6)
-        self._tab_buttons: list[QPushButton] = []
-        for index, tab in enumerate(self.KIND_TABS):
-            button = QPushButton(tab, left_frame)
+        tab_row.setSpacing(4)
+        self._tab_buttons: dict[str, QPushButton] = {}
+        for key, text in self.TABS:
+            button = QPushButton(text, card)
             button.setObjectName("TabButton")
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
-            button.setChecked(index == 0)
-            button.clicked.connect(lambda _c=False, i=index: self._switch_kind(i))
-            tab_row.addWidget(button)
-            self._tab_buttons.append(button)
-        left.addLayout(tab_row)
+            button.setChecked(key == self._kind)
+            button.clicked.connect(lambda _c=False, k=key: self._switch_kind(k))
+            tab_row.addWidget(button, 1)
+            self._tab_buttons[key] = button
+        root.addLayout(tab_row)
 
-        form = QFormLayout()
-        form.setSpacing(10)
-        form.setLabelAlignment(Qt.AlignRight)
+        body = QHBoxLayout()
+        body.setSpacing(14)
 
-        # 类型（中西日）
+        # ---- 左侧筛选列 ----
+        left_frame = QFrame(card)
+        left_frame.setObjectName("NameGenFilter")
+        left_frame.setFixedWidth(236)
+        left = QVBoxLayout(left_frame)
+        left.setContentsMargins(16, 14, 16, 14)
+        left.setSpacing(10)
+
+        cap_type = QLabel("类型", left_frame)
+        cap_type.setObjectName("DrawerHint")
+        left.addWidget(cap_type)
+        self._subtype_box = QVBoxLayout()   # 切页签时重建
+        self._subtype_box.setSpacing(6)
+        left.addLayout(self._subtype_box)
+
+        # 人物专属：风格 + 指定姓氏/名字
+        self._person_extra = QWidget(left_frame)
+        person_form = QFormLayout(self._person_extra)
+        person_form.setContentsMargins(0, 2, 0, 0)
+        person_form.setSpacing(8)
+        person_form.setLabelAlignment(Qt.AlignRight)
         style_row = QHBoxLayout()
         style_row.setSpacing(6)
         self._style_buttons: dict[str, QPushButton] = {}
-        for key, text in self.STYLE_KEYS:
-            button = QPushButton(text, left_frame)
+        for key, text in self.STYLES:
+            button = QPushButton(text, self._person_extra)
             button.setObjectName("ViewChip")
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
-            button.setChecked(key == "cn")
-            button.clicked.connect(
-                lambda _c=False, k=key: self._set_style(k)
-            )
+            button.setChecked(key == self._style)
+            button.clicked.connect(lambda _c=False, k=key: self._set_style(k))
             style_row.addWidget(button)
             self._style_buttons[key] = button
-        form.addRow("类型", style_row)
-
-        # 性别
-        gender_row = QHBoxLayout()
-        gender_row.setSpacing(6)
-        self._gender_buttons: dict[str, QPushButton] = {}
-        for key, text in self.GENDER_KEYS:
-            button = QPushButton(text, left_frame)
-            button.setObjectName("ViewChip")
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            button.setChecked(key == "any")
-            button.clicked.connect(
-                lambda _c=False, k=key: self._set_gender(k)
-            )
-            gender_row.addWidget(button)
-            self._gender_buttons[key] = button
-        form.addRow("性别", gender_row)
-
-        self.surname_edit = QLineEdit(left_frame)
+        person_form.addRow("风格", style_row)
+        self.surname_edit = QLineEdit(self._person_extra)
         self.surname_edit.setPlaceholderText("留空则随机")
-        self.given_edit = QLineEdit(left_frame)
+        self.given_edit = QLineEdit(self._person_extra)
         self.given_edit.setPlaceholderText("留空则随机")
-        form.addRow("指定姓氏", self.surname_edit)
-        form.addRow("指定名字", self.given_edit)
-        left.addLayout(form)
+        person_form.addRow("指定姓氏", self.surname_edit)
+        person_form.addRow("指定名字", self.given_edit)
+        left.addWidget(self._person_extra)
 
-        self.gender_row_widget = gender_row.parentWidget()
-        self._style = "cn"
-        self._gender = "any"
+        cap_suffix = QLabel("后缀", left_frame)
+        cap_suffix.setObjectName("DrawerHint")
+        left.addWidget(cap_suffix)
+        self.suffix_edit = QLineEdit(left_frame)
+        self.suffix_edit.setPlaceholderText("请输入指定后缀（选填）")
+        left.addWidget(self.suffix_edit)
 
         left.addStretch(1)
         self.generate_button = QPushButton("生成", left_frame)
         self.generate_button.setObjectName("Primary")
-        self.generate_button.setFixedHeight(40)
+        self.generate_button.setFixedHeight(42)
         self.generate_button.setCursor(Qt.PointingHandCursor)
         self.generate_button.clicked.connect(self.generate)
         left.addWidget(self.generate_button)
-        layout.addWidget(left_frame)
+        body.addWidget(left_frame)
 
-        # ============ 右侧结果区（60%） ============
-        right_frame = QFrame(self)
-        right = QVBoxLayout(right_frame)
-        right.setContentsMargins(18, 20, 18, 16)
-        right.setSpacing(10)
-
+        # ---- 右侧结果区：胶囊墙 ----
+        right = QVBoxLayout()
+        right.setSpacing(8)
         result_header = QHBoxLayout()
-        self.result_hint = QLabel("点击任意名字即可复制", right_frame)
+        self.result_hint = QLabel("点击任意名字即可复制", card)
         self.result_hint.setObjectName("DrawerHint")
-        refresh_button = _ghost("换一批", right_frame)
+        refresh_button = _ghost("换一批", card)
         refresh_button.clicked.connect(self.generate)
         result_header.addWidget(self.result_hint, 1)
         result_header.addWidget(refresh_button)
         right.addLayout(result_header)
 
-        self._grid_widget = QWidget(right_frame)
+        self._grid_widget = QWidget(card)
         self._grid = QGridLayout(self._grid_widget)
         self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setHorizontalSpacing(10)
-        self._grid.setVerticalSpacing(10)
+        self._grid.setHorizontalSpacing(8)
+        self._grid.setVerticalSpacing(8)
 
-        scroll = QScrollArea(right_frame)
+        scroll = QScrollArea(card)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -1073,20 +1213,70 @@ class NameGeneratorDialog(QDialog):
         self._grid_flasher = ScrollFlasher(scroll, Qt.Vertical, inset=6)
         scroll.setWidget(self._grid_widget)
         right.addWidget(scroll, 1)
+        body.addLayout(right, 1)
 
-        self.toast = ToastLabel(right_frame)
-        layout.addWidget(right_frame, 1)
+        root.addLayout(body, 1)
+        self.toast = ToastLabel(card)
 
+        self._rebuild_subtype_chips()
         self.generate()
 
     # ------------------------------------------------------------------
-    def _switch_kind(self, index: int) -> None:
-        self._kind = "person" if index == 0 else "place"
-        for i, button in enumerate(self._tab_buttons):
-            button.setChecked(i == index)
-        # 性别只对人物有意义
-        for button in self._gender_buttons.values():
-            button.setEnabled(self._kind == "person")
+    # 拖动：按住卡片空白处 / 标题栏即可移动窗口
+    # ------------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+    # ------------------------------------------------------------------
+    def _switch_kind(self, key: str) -> None:
+        self._kind = key
+        self._subtype = self.SUBTYPES[key][0][0]
+        for k, button in self._tab_buttons.items():
+            button.setChecked(k == key)
+        self._rebuild_subtype_chips()
+        self._person_extra.setVisible(key == "person")
+        self.generate()
+
+    def _rebuild_subtype_chips(self) -> None:
+        """按当前页签重建「类型」子筛选胶囊。"""
+        while self._subtype_box.count():
+            item = self._subtype_box.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+                continue
+            inner = item.layout()
+            if inner is not None:   # 行布局：逐个删除里面的胶囊按钮
+                while inner.count():
+                    child = inner.takeAt(0)
+                    if child.widget() is not None:
+                        child.widget().deleteLater()
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        for key, text in self.SUBTYPES[self._kind]:
+            button = QPushButton(text, self._person_extra.parentWidget())
+            button.setObjectName("ViewChip")
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setChecked(key == self._subtype)
+            button.clicked.connect(lambda _c=False, k=key: self._set_subtype(k))
+            row.addWidget(button)
+        row.addStretch(1)
+        self._subtype_box.addLayout(row)
+
+    def _set_subtype(self, key: str) -> None:
+        self._subtype = key
         self.generate()
 
     def _set_style(self, key: str) -> None:
@@ -1095,20 +1285,15 @@ class NameGeneratorDialog(QDialog):
             button.setChecked(k == key)
         self.generate()
 
-    def _set_gender(self, key: str) -> None:
-        self._gender = key
-        for k, button in self._gender_buttons.items():
-            button.setChecked(k == key)
-        self.generate()
-
     def generate(self) -> None:
         names = name_data.generate_names(
             kind=self._kind,
+            subtype=self._subtype,
             style=self._style,
-            gender=self._gender,
             surname=self.surname_edit.text(),
             given=self.given_edit.text(),
-            count=21,
+            suffix=self.suffix_edit.text(),
+            count=self.COUNT,
         )
         # 清空旧结果
         while self._grid.count():
@@ -1117,17 +1302,16 @@ class NameGeneratorDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
 
-        columns = 3
         for index, name in enumerate(names):
             chip = QPushButton(name, self._grid_widget)
             chip.setObjectName("NameChip")
             chip.setCursor(Qt.PointingHandCursor)
-            chip.setMinimumHeight(44)
+            chip.setMinimumHeight(36)
             chip.setToolTip("点击复制")
             chip.clicked.connect(lambda _c=False, n=name: self._copy(n))
-            row, col = divmod(index, columns)
+            row, col = divmod(index, self.COLUMNS)
             self._grid.addWidget(chip, row, col)
-        for col in range(columns):
+        for col in range(self.COLUMNS):
             self._grid.setColumnStretch(col, 1)
         self.result_hint.setText(f"已生成 {len(names)} 个名字 · 点击即可复制")
 

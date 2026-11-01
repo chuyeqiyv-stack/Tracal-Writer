@@ -653,6 +653,13 @@ class BookshelfPage(QWidget):
     delete_map_requested = Signal(str)
     export_book_requested = Signal(str)
 
+    # 导入（软件导出的同类型文件）
+    import_book_requested = Signal()
+    import_note_requested = Signal()
+    import_timeline_requested = Signal()
+    import_outline_requested = Signal()
+    import_map_requested = Signal()
+
     # 书架主页「统计」页：打开完整统计窗口
     stats_open_requested = Signal()
 
@@ -1184,6 +1191,13 @@ class BookshelfPage(QWidget):
         menu.addAction("新建时间轴", self.new_timeline_requested.emit)
         menu.addAction("新建大纲", self.new_outline_requested.emit)
         menu.addAction("新建世界地图", self.new_map_requested.emit)
+        menu.addSeparator()
+        import_menu = menu.addMenu("导入文件…")
+        import_menu.addAction("导入小说 TXT…", self.import_book_requested.emit)
+        import_menu.addAction("导入设定 TXT…", self.import_note_requested.emit)
+        import_menu.addAction("导入时间轴 JSON…", self.import_timeline_requested.emit)
+        import_menu.addAction("导入大纲 JSON…", self.import_outline_requested.emit)
+        import_menu.addAction("导入地图底图…", self.import_map_requested.emit)
         menu.addSeparator()
         menu.addAction("新建分组", self.new_group_requested.emit)
         if self._page in {"home", "trash"}:

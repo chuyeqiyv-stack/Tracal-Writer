@@ -187,6 +187,26 @@ def rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha:.2f})"
 
 
+def qc(color: str) -> QColor:
+    """解析颜色字符串：支持 #RRGGBB 与 QSS 的 rgba() 写法。
+
+    QColor 原生不认识 "rgba(r, g, b, a)" 字符串，直接传入会得到无效颜色
+    （绘制时表现为黑色）。这里统一解析，供 QPainter 自绘控件使用。
+    """
+    c = QColor(color)
+    if c.isValid():
+        return c
+    s = color.strip()
+    if s.startswith("rgba"):
+        try:
+            parts = s[s.index("(") + 1 : s.rindex(")")].split(",")
+            c = QColor(int(parts[0]), int(parts[1]), int(parts[2]))
+            c.setAlphaF(float(parts[3]))
+        except (ValueError, IndexError):
+            c = QColor(0, 0, 0, 0)
+    return c
+
+
 def build_palette(theme: dict[str, str]) -> QPalette:
     """生成应用调色板，让原生控件（复选框、下拉箭头等）跟随主题。"""
     pal = QPalette()

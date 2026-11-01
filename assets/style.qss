@@ -89,6 +89,17 @@ QListWidget::item:selected { background: $hover; color: $text; }
     font-weight: 700;
     padding: 2px 0 0 0;
 }
+/* 双击标题进入行内编辑（双通道改名） */
+QLineEdit#EditorTitleEdit {
+    background: transparent;
+    border: 1px dashed $accent;
+    border-radius: ${radius_sm}px;
+    color: $editor_text;
+    font-size: 24px;
+    font-weight: 700;
+    padding: 2px 0;
+    selection-background-color: $selection;
+}
 #EditorPaper {
     background: $editor;
     border: none;
@@ -144,17 +155,28 @@ QTextEdit#Preview {
     alignment: right;
 }
 #SidePanelKey { color: $subtext; font-size: 11px; }
-#SidePanelStatus { color: $subtext; font-size: 11px; }
+#SidePanelStatus { color: $subtext; font-size: 12px; }
+/* 数据行：浅灰圆角卡片（参考竞品时速面板） */
+#SideCard {
+    background: $panel_alt;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 2px;
+}
+#SideCard QLabel { background: transparent; }
+/* 标题旁的“?”帮助小按钮 */
+#SidePanelHelp {
+    background: transparent;
+    border: none;
+    border-radius: ${radius_sm}px;
+    color: $subtext;
+    font-size: 11px;
+    padding: 1px 5px;
+}
+#SidePanelHelp:hover { background: $hover; color: $text; }
 /* 单位拨动开关两侧的文字标签：激活侧加粗高亮 */
 #UnitLabel { color: $subtext; font-size: 11px; background: transparent; }
 #UnitLabel[active="true"] { color: $accent; font-weight: 700; }
-/* 数据行：无底色，靠间距与字重分层 */
-#SidePanelRow {
-    background: transparent;
-    border: none;
-    padding: 5px 2px;
-}
-#SidePanelRow QLabel { background: transparent; }
 /* 面板右上小工具按钮（单位切换 / 刷新） */
 #PanelToolButton {
     background: transparent;

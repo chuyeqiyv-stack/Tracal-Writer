@@ -156,6 +156,21 @@ class Storage:
         self.save_library(library)
         return item.to_dict()
 
+    def import_timeline(self, item_dict: dict) -> dict:
+        """从导出的 JSON dict 导入一条时间轴（分配新 id，避免冲突）。"""
+        from app.models import TimelineItem
+
+        data = dict(item_dict)
+        data["id"] = new_id()
+        data.pop("created_at", None)
+        data.pop("updated_at", None)
+        item = TimelineItem.from_dict(data)
+        item.touch()
+        library = self.load_library()
+        library["timelines"].append(item.to_dict())
+        self.save_library(library)
+        return item.to_dict()
+
     def save_timeline(self, item_dict: dict) -> None:
         """按 id 覆盖保存一条时间轴。"""
         library = self.load_library()
@@ -208,6 +223,18 @@ class Storage:
             library["notes"].append(doc_dict)
         self.save_library(library)
 
+    def import_note_doc(self, title: str, content: str) -> dict:
+        """从 TXT 导入一篇设定文档。"""
+        from app.models import SettingDoc
+
+        doc = SettingDoc(id=new_id(), title=title.strip() or "导入的设定")
+        doc.content = content
+        doc.touch()
+        library = self.load_library()
+        library["notes"].append(doc.to_dict())
+        self.save_library(library)
+        return doc.to_dict()
+
     def delete_note(self, note_id: str) -> None:
         library = self.load_library()
         library["notes"] = [n for n in library["notes"] if n.get("id") != note_id]
@@ -239,6 +266,21 @@ class Storage:
         else:
             library["outlines"].append(item_dict)
         self.save_library(library)
+
+    def import_outline(self, item_dict: dict) -> dict:
+        """从导出的 JSON dict 导入一条大纲（分配新 id，避免冲突）。"""
+        from app.models import OutlineItem
+
+        data = dict(item_dict)
+        data["id"] = new_id()
+        data.pop("created_at", None)
+        data.pop("updated_at", None)
+        item = OutlineItem.from_dict(data)
+        item.touch()
+        library = self.load_library()
+        library["outlines"].append(item.to_dict())
+        self.save_library(library)
+        return item.to_dict()
 
     def delete_outline(self, outline_id: str) -> None:
         library = self.load_library()
@@ -332,6 +374,29 @@ class Storage:
     def add_map(self, title: str) -> dict:
         """新建一张空白世界地图。"""
         item = self._normalize_map({"id": new_id(), "title": title.strip() or "未命名地图"})
+        maps = self.load_maps()
+        maps.append(item)
+        self.save_maps(maps)
+        return item
+
+    def import_map_image(self, source: str | Path, title: str = "") -> dict:
+        """把图片文件导入为新地图的底图（图片复制进数据目录 maps/）。"""
+        src = Path(source)
+        suffix = src.suffix.lower() or ".png"
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            suffix = ".png"
+        map_id = new_id()
+        maps_dir = self.base_dir / "maps"
+        maps_dir.mkdir(parents=True, exist_ok=True)
+        target = maps_dir / f"{map_id}{suffix}"
+        shutil.copyfile(src, target)
+        item = self._normalize_map(
+            {
+                "id": map_id,
+                "title": title.strip() or src.stem or "导入的地图",
+                "bg": {"path": str(target), "w": 0, "h": 0},
+            }
+        )
         maps = self.load_maps()
         maps.append(item)
         self.save_maps(maps)
