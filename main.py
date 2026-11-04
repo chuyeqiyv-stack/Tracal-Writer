@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QLibraryInfo, Qt, QTranslator
+from PySide6.QtCore import QLibraryInfo, Qt, QTimer, QTranslator
 from PySide6.QtGui import QFont, QIcon
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app import config
+from app.single_instance import InstanceLock
 from app.storage import Storage
 from app.ui.main_window import MainWindow
 
@@ -45,9 +46,42 @@ def main() -> int:
         if translator.load(name, translations_path):
             app.installTranslator(translator)
 
+    # 同一数据目录只允许一个写入进程：两个窗口并存时，退出/自动保存的
+    # 整份 library.json 回写会把另一进程刚保存的时间轴事件覆盖掉。
+    lock = InstanceLock(config.DATA_DIR)
+    if not lock.acquire():
+        pid = lock.holder_pid()
+        QMessageBox.warning(
+            None,
+            "催客写作已在运行",
+            "检测到另一个「催客写作」正在使用同一数据目录：\n"
+            f"{config.DATA_DIR}\n\n"
+            + (f"占用进程 PID：{pid}\n\n" if pid else "")
+            + "为避免两个窗口互相覆盖数据，本次启动已退出。\n"
+            "请先关闭已打开的窗口，再重新启动。",
+        )
+        return 1
+    app.aboutToQuit.connect(lock.release)
+
     storage = Storage()
-    window = MainWindow(storage)
-    window.show()
+    settings = storage.load_settings()
+
+    if getattr(settings, "boot_animation", True):
+        # 启动动画与主窗口初始化并行：先让莲花首帧上屏，下一事件循环节拍再构造主窗口。
+        from app.ui.boot_lotus import BootSequence
+        from app.ui.theme import build_theme
+
+        boot = BootSequence(build_theme(settings), settings.mode == "dark")
+        boot.start()
+
+        def _build_main_window() -> None:
+            boot.mark_ready(MainWindow(storage))
+
+        QTimer.singleShot(0, _build_main_window)
+    else:
+        # 关闭动画时零额外开销
+        window = MainWindow(storage)
+        window.show()
 
     return app.exec()
 

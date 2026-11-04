@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import time
-from collections import deque
 
 
 class WritingSpeedTracker:
@@ -16,6 +15,7 @@ class WritingSpeedTracker:
     IDLE_GRACE = 30.0   # 停止写作 30 秒后才开始记录空闲时长
 
     def __init__(self) -> None:
+        self.paused = False          # v3：时速面板右键暂停统计（不清零已有数据）
         self.reset()
 
     def reset(self) -> None:
@@ -23,16 +23,15 @@ class WritingSpeedTracker:
         self.active_seconds = 0.0     # 有效写作时长（秒）
         self.idle_accumulated = 0.0   # 已定格的累计空闲秒数（不清零，逐段累加）
         self._last_ts: float | None = None
-        self._recent: deque[tuple[float, int]] = deque()
-        self.started_at = time.monotonic()
 
     def record(self, delta: int) -> None:
         """记录一次新增字数（由编辑器发出）。
 
         空闲规则：停止写作超过 30 秒的部分才计入空闲时长；
         重新打字时立刻停止记录但不清零，下一次空闲接着累加。
+        暂停（paused=True）时完全不计入，已有数据保留。
         """
-        if delta <= 0:
+        if delta <= 0 or self.paused:
             return
         now = time.monotonic()
         if self._last_ts is not None:
@@ -45,10 +44,6 @@ class WritingSpeedTracker:
         self._last_ts = now
         self.total_chars += delta
 
-        self._recent.append((now, delta))
-        while self._recent and now - self._recent[0][0] > 60:
-            self._recent.popleft()
-
     # ------------------------------------------------------------------
     @property
     def speed_per_hour(self) -> float:
@@ -57,13 +52,6 @@ class WritingSpeedTracker:
         if seconds <= 0:
             return 0.0
         return self.total_chars / seconds * 3600
-
-    @property
-    def recent_speed_per_hour(self) -> float:
-        """最近一分钟的瞬时速度（字/小时）。"""
-        now = time.monotonic()
-        total = sum(delta for ts, delta in self._recent if now - ts <= 60)
-        return total * 60.0
 
     @property
     def elapsed_text(self) -> str:

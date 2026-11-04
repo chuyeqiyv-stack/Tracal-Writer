@@ -13,7 +13,7 @@ from pathlib import Path
 
 APP_NAME = "催客写作"
 APP_NAME_EN = "Trecal"   # 英文品牌展示名
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
 ORG_NAME = "MojiWriter"  # 数据目录沿用旧名，避免升级后找不到已有数据
 
 # 默认正文字体（Windows 下若缺失会自动回退）
@@ -123,21 +123,7 @@ def set_custom_data_dir(path: Path | str) -> None:
     (default / POINTER_FILE_NAME).write_text(str(Path(path)), encoding="utf-8")
 
 
-def data_dir_source() -> str:
-    """当前数据目录来源：custom（指针/环境变量）或 default。"""
-    if os.environ.get("MOJI_DATA_DIR"):
-        return "custom"
-    for pointer_dir in (_default_data_dir(), _legacy_default_data_dir()):
-        if (pointer_dir / POINTER_FILE_NAME).exists():
-            return "custom"
-    return "default"
-
-
 DATA_DIR = _user_data_dir()
-LIBRARY_FILE = DATA_DIR / "library.json"
-SETTINGS_FILE = DATA_DIR / "settings.json"
-BOOKS_DIR = DATA_DIR / "books"
-HISTORY_DIR = DATA_DIR / "history"
 
 # 每本书最多保留的历史快照数量（获得「坚持不懈」成就后 +2）
 MAX_SNAPSHOTS = 5

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""书架主页：左侧导航（首页 / 时间轴 / 大纲 / 设定 / 世界地图 / 成就 / 回收站）+ 右侧内容区。
+"""书架主页：左侧导航（首页 / 时间轴 / 大纲 / 设定 / 地图 / 成就 / 回收站）+ 右侧内容区。
 
 - 书籍：大尺寸 3:4 封面卡片（网格）与列表行，带新作品角标与悬浮阴影；
-- 时间轴 / 设定 / 大纲 / 世界地图：独立卡片，可创建 / 打开；
+- 时间轴 / 设定 / 大纲 / 地图：独立卡片，可创建 / 打开；
 - 成就页：展示已解锁 / 未解锁的勋章；
 - 空白处与卡片右键均提供现代圆角菜单（新建作品 / 新建设定 / 新建时间轴等）。
 """
@@ -12,8 +12,8 @@ import time
 
 from app import config
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QCursor, QFontMetrics, QImage, QPixmap
+from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtGui import QColor, QCursor, QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsDropShadowEffect,
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from app.services.achievements import ACHIEVEMENTS
 from app.services.word_count import format_word_count
-from app.ui.widgets import AvatarView, CardFrame, CoverView
+from app.ui.widgets import AvatarView, CardFrame, CoverView, GlassButton
 
 # 大封面卡片尺寸（封面满铺卡片宽度，3:4 书籍比例）
 CARD_W = 204
@@ -354,31 +354,15 @@ class AchievementCard(CardFrame):
 
         from app.ui.medal_art import medal_pixmap
 
-        unlocked = unlocked_ts > 0
-        pix = medal_pixmap(key, 96)
+        # 灰度与缩放结果均在 medal_pixmap 内按 (key,size,gray) 缓存，重建页面零重算
+        pix = medal_pixmap(key, 84, gray=not self.unlocked)
         if not pix.isNull():
-            if not unlocked:
-                # 灰度化但保留透明通道（Format_Grayscale8 会丢 alpha，透明区变黑底）
-                src = pix.toImage().convertToFormat(QImage.Format_ARGB32)
-                gray = src.convertToFormat(QImage.Format_Grayscale8).convertToFormat(
-                    QImage.Format_ARGB32
-                )
-                mask = src.convertToFormat(QImage.Format_Alpha8)
-                from PySide6.QtGui import QPainter
-
-                painter = QPainter(gray)
-                painter.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-                painter.drawImage(0, 0, mask)
-                painter.end()
-                pix = QPixmap.fromImage(gray)
-            self.medal_label.setPixmap(
-                pix.scaled(84, 84, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
+            self.medal_label.setPixmap(pix)
         name = str(info.get("name") or "")
         sub = str(info.get("sub") or "")
         self.name_label.setText(_elide(name, CARD_W - 28, self.name_label.font()))
         self.sub_label.setText(_elide(sub, CARD_W - 28, self.sub_label.font()))
-        if unlocked:
+        if self.unlocked:
             self.desc_label.setText(
                 f"{info.get('cond') or ''}\n解锁于 {_date_text(unlocked_ts)}"
             )
@@ -441,12 +425,20 @@ class ShelfNav(QFrame):
         layout.addSpacing(12)
 
         self.page_buttons: dict[str, QPushButton] = {}
+        # 侧边栏导航图标（全站统一图标集）
+        self._nav_icons = {
+            "home": "home", "timeline": "timeline", "outline": "mind",
+            "notes": "chapter", "characters": "user", "map": "map",
+            "achievements": "medal", "stats": "count", "trash": "trash",
+        }
+        self._icon_factory = None
 
         def nav_button(key: str, text: str) -> QPushButton:
             button = QPushButton(text, self)
             button.setObjectName("NavButton")
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
+            button.setIconSize(QSize(16, 16))
             button.clicked.connect(lambda _c=False, k=key: self.set_page(k))
             layout.addWidget(button)
             self.page_buttons[key] = button
@@ -456,7 +448,8 @@ class ShelfNav(QFrame):
         nav_button("timeline", "时间轴")
         nav_button("outline", "大纲")
         nav_button("notes", "设定")
-        nav_button("map", "世界地图")
+        nav_button("characters", "角色")
+        nav_button("map", "地图")
         nav_button("achievements", "成就")
         nav_button("stats", "统计")
         nav_button("trash", "回收站")
@@ -532,9 +525,42 @@ class ShelfNav(QFrame):
         self.set_page("home")
 
     # ------------------------------------------------------------------
+    def refresh_icons(self, factory) -> None:
+        """主题切换时重建导航 / 分组图标；选中页用 accent 单色帧。"""
+        self._icon_factory = factory
+        current = self._page
+        for key, button in self.page_buttons.items():
+            icon_name = self._nav_icons.get(key)
+            if icon_name:
+                button.setIcon(factory.icon(icon_name, 16))
+        self.all_button.setIconSize(QSize(16, 16))
+        self.all_button.setIcon(factory.icon("shelf", 16))
+        for button in self.group_buttons.values():
+            button.setIconSize(QSize(16, 16))
+            button.setIcon(factory.icon("folder", 16))
+        self.set_page(current)
+
+    def _apply_page_icon(self, key: str) -> None:
+        """选中页图标切 accent 帧（QSS 不负责换 QIcon 颜色）。"""
+        if self._icon_factory is None:
+            return
+        for name, button in self.page_buttons.items():
+            icon_name = self._nav_icons.get(name)
+            if not icon_name:
+                continue
+            from PySide6.QtGui import QIcon as _QI
+
+            frame = self._icon_factory.pixmap(
+                icon_name, 16, state=_QI.On if name == key else _QI.Off,
+                dpr=button.screen().devicePixelRatio() if button.screen() else 1.0,
+            )
+            button.setIcon(_QI(frame))
+
     def set_page(self, key: str) -> None:
+        self._page = key
         for name, button in self.page_buttons.items():
             button.setChecked(name == key)
+        self._apply_page_icon(key)
         self.page_changed.emit(key)
 
     def set_group(self, group_id: str) -> None:
@@ -564,6 +590,9 @@ class ShelfNav(QFrame):
             layout.insertWidget(insert_at, button)
             insert_at += 1
             self.group_buttons[gid] = button
+            button.setIconSize(QSize(16, 16))
+            if self._icon_factory is not None:
+                button.setIcon(self._icon_factory.icon("folder", 16))
             button.setChecked(gid == current)
 
     def _show_group_menu(self, group_id: str, button: QPushButton) -> None:
@@ -646,7 +675,13 @@ class BookshelfPage(QWidget):
     rename_outline_requested = Signal(str)
     delete_outline_requested = Signal(str)
 
-    # 世界地图（可创建多张）与书籍导出
+    # 角色卡与角色关系
+    new_character_requested = Signal()
+    character_view_changed = Signal(str)
+    characters_changed = Signal()
+    import_characters_requested = Signal()
+
+    # 地图（可创建多张）与书籍导出
     open_map_requested = Signal(str)
     new_map_requested = Signal()
     rename_map_requested = Signal(str)
@@ -666,7 +701,7 @@ class BookshelfPage(QWidget):
     # 成就勋章展示（成就页右键已解锁成就触发；空串 = 卸下）
     medal_showcase_requested = Signal(str)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, storage=None) -> None:
         super().__init__(parent)
         self._page = "home"
         self._group = ""
@@ -678,6 +713,12 @@ class BookshelfPage(QWidget):
         self._notes: list[dict] = []
         self._outlines: list[dict] = []
         self._maps: list[dict] = []
+        self._characters: list[dict] = []
+        self._character_relations: list[dict] = []
+        self._theme: dict = {}
+        self._storage = storage
+        self._characters_panel = None
+        self._char_view = "list"
         self._unlocked: dict[str, float] = {}
         self._showcase = ""
 
@@ -724,9 +765,9 @@ class BookshelfPage(QWidget):
         header.addWidget(self.empty_trash_button)
         header.addSpacing(8)
 
-        self.new_button = QPushButton("＋ 新建作品", self)
-        self.new_button.setObjectName("Primary")
-        self.new_button.setCursor(Qt.PointingHandCursor)
+        self.new_button = GlassButton("新建作品", self)
+        self.new_button.setObjectName("GlassPrimary")
+        self.new_button.setIconSize(QSize(16, 16))
         self.new_button.clicked.connect(self._on_new_button)
         header.addWidget(self.new_button)
         right.addLayout(header)
@@ -771,6 +812,8 @@ class BookshelfPage(QWidget):
         self.empty_label.hide()
 
         outer.addLayout(right, 1)
+        # 角色面板宿主（与 scroll / empty_label 同级，避免嵌进滚动区）
+        self._content_host = right
 
         self.nav.page_changed.connect(self._on_page_changed)
         self.nav.group_changed.connect(self._on_group_changed)
@@ -804,9 +847,23 @@ class BookshelfPage(QWidget):
         self._render()
 
     def set_maps(self, items: list[dict]) -> None:
-        """同步世界地图列表（可创建多张）。"""
+        """同步地图列表（可创建多张）。"""
         self._maps = list(items or [])
         self._render()
+
+    def set_characters(self, characters: list[dict], relations: list[dict],
+                       theme: dict, view: str = "") -> None:
+        """同步角色与关系数据（theme 供面板渲染取色，view 为列表/关系图偏好）。"""
+        if view in ("list", "board"):
+            self._char_view = view
+        # 关系图拖拽期间只改坐标、数量不变，跳过整页 _render（面板内部已自行刷新）
+        sig = (len(characters or []), len(relations or []))
+        unchanged = sig == (len(self._characters), len(self._character_relations))
+        self._characters = list(characters or [])
+        self._character_relations = list(relations or [])
+        self._theme = dict(theme or {})
+        if self._page == "characters" and not unchanged:
+            self._render()
 
     def set_achievements(self, unlocked: dict) -> None:
         self._unlocked = dict(unlocked or {})
@@ -843,6 +900,10 @@ class BookshelfPage(QWidget):
         if self._group == group_id:
             self.nav.set_group("")
 
+    def refresh_icons(self, factory) -> None:
+        """CTA 主按钮：on_accent 色的 + 图标（GlassPrimary 是 accent 底）。"""
+        self.new_button.setIcon(factory.icon("add", 16))
+
     def _on_new_button(self) -> None:
         if self._page == "timeline":
             self.new_timeline_requested.emit()
@@ -850,6 +911,8 @@ class BookshelfPage(QWidget):
             self.new_note_requested.emit()
         elif self._page == "outline":
             self.new_outline_requested.emit()
+        elif self._page == "characters":
+            self.new_character_requested.emit()
         elif self._page == "map":
             self.new_map_requested.emit()
         else:
@@ -867,13 +930,17 @@ class BookshelfPage(QWidget):
         return items
 
     def _render(self) -> None:
+        # 离开角色页时隐藏角色面板
+        if self._characters_panel is not None and self._page != "characters":
+            self._characters_panel.hide()
         # 标题与副标题
         titles = {
             "home": "首页",
             "timeline": "时间轴",
             "outline": "大纲",
             "notes": "设定",
-            "map": "世界地图",
+            "characters": "角色",
+            "map": "地图",
             "achievements": "成就",
             "stats": "统计",
             "trash": "回收站",
@@ -895,12 +962,16 @@ class BookshelfPage(QWidget):
             self.subtitle_label.setText(f"共 {len(self._outlines)} 张大纲思维导图 · 点击卡片打开")
         elif self._page == "notes":
             self.subtitle_label.setText(f"共 {len(self._notes)} 篇设定文档 · 点击卡片打开")
+        elif self._page == "characters":
+            self.subtitle_label.setText(
+                f"共 {len(self._characters)} 名角色 · {len(self._character_relations)} 条关系 · 顶部可切换「关系图」视图"
+            )
         elif self._page == "map":
             count = len(self._maps)
             self.subtitle_label.setText(
-                f"共 {count} 张世界地图 · 点击卡片打开绘制"
+                f"共 {count} 张地图 · 点击卡片打开绘制"
                 if count
-                else "还没有创建世界地图 · 点击右上角按钮新建"
+                else "还没有创建地图 · 点击右上角按钮新建"
             )
         elif self._page == "achievements":
             count = len(self._unlocked)
@@ -926,15 +997,17 @@ class BookshelfPage(QWidget):
         if self._page != "trash":
             self.empty_trash_button.hide()
         if self._page == "timeline":
-            self.new_button.setText("＋ 新建时间轴")
+            self.new_button.setText("新建时间轴")
         elif self._page == "notes":
-            self.new_button.setText("＋ 新建设定")
+            self.new_button.setText("新建设定")
         elif self._page == "outline":
-            self.new_button.setText("＋ 新建大纲")
+            self.new_button.setText("新建大纲")
+        elif self._page == "characters":
+            self.new_button.setText("新建角色")
         elif self._page == "map":
-            self.new_button.setText("＋ 新建世界地图")
+            self.new_button.setText("新建地图")
         else:
-            self.new_button.setText("＋ 新建作品")
+            self.new_button.setText("新建作品")
         self.new_button.setVisible(self._page not in ("achievements", "stats"))
 
         # 清空旧卡片（立即隐藏避免删除延迟期间的残影）
@@ -954,6 +1027,9 @@ class BookshelfPage(QWidget):
             return
         if self._page == "notes":
             self._render_notes()
+            return
+        if self._page == "characters":
+            self._render_characters()
             return
         if self._page == "map":
             self._render_map()
@@ -1083,11 +1159,49 @@ class BookshelfPage(QWidget):
             cards.append(card)
         self._fill_item_grid(cards)
 
+    def _render_characters(self) -> None:
+        """角色页：角色卡管理面板（惰性创建，需要 storage）。"""
+        if self._characters_panel is None:
+            if self._storage is None:
+                self.empty_label.setText("角色功能需要重新打开软件后可用")
+                self.scroll.hide()
+                self.empty_label.show()
+                return
+            from app.ui.characters import CharactersPanel
+
+            self._characters_panel = CharactersPanel(
+                self._storage, getattr(self, "_char_view", "list"), self
+            )
+            self._content_host.addWidget(self._characters_panel, 1)
+            self._characters_panel.data_changed.connect(self.characters_changed.emit)
+            self._characters_panel.view_changed.connect(self.character_view_changed.emit)
+            self._characters_panel.import_requested.connect(
+                self.import_characters_requested.emit
+            )
+        panel = self._characters_panel
+        self.empty_label.hide()
+        self.grid_holder.hide()
+        self.list_holder.hide()
+        self.scroll.hide()
+        panel.set_theme(self._theme)
+        panel.set_data(self._characters, self._character_relations)
+        panel.show()
+
+    def characters_view(self):
+        """角色面板（未创建时先创建）；供主窗口直接调用其增删改方法。"""
+        if self._characters_panel is None and self._storage is not None:
+            self._render_characters()
+        return self._characters_panel
+
+    def characters_panel(self):
+        """已创建的角色面板（未创建返回 None），用于同步作品名而不触发创建。"""
+        return self._characters_panel
+
     def _render_map(self) -> None:
-        """世界地图页：多张地图卡片，可新建 / 打开 / 重命名 / 删除。"""
+        """地图页：多张地图卡片，可新建 / 打开 / 重命名 / 删除。"""
         if not self._maps:
             self.scroll.hide()
-            self.empty_label.setText("还没有世界地图\n点击右上角「＋ 新建世界地图」开始绘制")
+            self.empty_label.setText("还没有地图\n点击右上角「新建地图」开始绘制")
             self.empty_label.show()
             return
         cards: list[ItemCard] = []
@@ -1123,13 +1237,6 @@ class BookshelfPage(QWidget):
         # 必须经 lambda 转发（直连会在真实点击时抛 TypeError 导致卡片点不开统计）
         card.clicked.connect(lambda _item_id="": self.stats_open_requested.emit())
         card.open_requested.connect(lambda _item_id="": self.stats_open_requested.emit())
-
-        def _menu(event) -> None:
-            menu = QMenu(card)
-            menu.addAction("打开完整统计", self.stats_open_requested.emit)
-            menu.exec(event.globalPos())
-
-        card.contextMenuEvent = _menu  # type: ignore
         self._fill_item_grid([card])
 
     def _render_achievements(self) -> None:
@@ -1190,13 +1297,15 @@ class BookshelfPage(QWidget):
         menu.addAction("新建设定", self.new_note_requested.emit)
         menu.addAction("新建时间轴", self.new_timeline_requested.emit)
         menu.addAction("新建大纲", self.new_outline_requested.emit)
-        menu.addAction("新建世界地图", self.new_map_requested.emit)
+        menu.addAction("新建角色", self.new_character_requested.emit)
+        menu.addAction("新建地图", self.new_map_requested.emit)
         menu.addSeparator()
         import_menu = menu.addMenu("导入文件…")
         import_menu.addAction("导入小说 TXT…", self.import_book_requested.emit)
         import_menu.addAction("导入设定 TXT…", self.import_note_requested.emit)
         import_menu.addAction("导入时间轴 JSON…", self.import_timeline_requested.emit)
         import_menu.addAction("导入大纲 JSON…", self.import_outline_requested.emit)
+        import_menu.addAction("导入角色 JSON…", self.import_characters_requested.emit)
         import_menu.addAction("导入地图底图…", self.import_map_requested.emit)
         menu.addSeparator()
         menu.addAction("新建分组", self.new_group_requested.emit)

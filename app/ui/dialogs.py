@@ -5,8 +5,11 @@ from __future__ import annotations
 import os
 import time
 
-from PySide6.QtCore import QDate, QPoint, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTextCursor
+from PySide6.QtCore import QDate, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPalette, QPen, QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,9 +29,9 @@ from PySide6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSlider,
-    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -53,6 +56,21 @@ def _primary(text: str, parent=None) -> QPushButton:
 def _ghost(text: str, parent=None) -> QPushButton:
     button = QPushButton(text, parent)
     button.setCursor(Qt.PointingHandCursor)
+    return button
+
+
+def _close_icon_button(parent=None, tooltip: str = "关闭") -> QPushButton:
+    """右上角 30x30 关闭钮：用全站统一 close 图标（跟随当前文字色）。"""
+    button = QPushButton(parent)
+    button.setObjectName("GhostButton")
+    button.setCursor(Qt.PointingHandCursor)
+    button.setFixedSize(30, 30)
+    button.setToolTip(tooltip)
+    button.setAccessibleName(tooltip)
+    text_color = QApplication.palette().windowText().color().name()
+    from app.ui.icons import IconFactory
+
+    button.setIcon(IconFactory(text_color).icon("close", 14))
     return button
 
 
@@ -92,14 +110,23 @@ class MessageBox(QDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 28, 28, 28)   # 给阴影留出空间
 
-        card = QFrame(self)
-        card.setObjectName("MessageBox")
-        effect = QGraphicsDropShadowEffect(card)
-        effect.setBlurRadius(36)
-        effect.setOffset(0, 10)
-        effect.setColor(QColor(24, 26, 32, 70))
-        card.setGraphicsEffect(effect)
+        from app.ui import surface as _surface
+
+        if _surface.is_glass():
+            # 玻璃风：QSS 已让 QFrame#MessageBox 透明，必须自绘外壳 + 内嵌内容板
+            card = _surface.ReadableCard(14.0, self)
+            from app.ui.motion import apply_elevation, app_is_dark
+            apply_elevation(card, 1, app_is_dark())
+        else:
+            card = QFrame(self)
+            card.setObjectName("MessageBox")
+            effect = QGraphicsDropShadowEffect(card)
+            effect.setBlurRadius(36)
+            effect.setOffset(0, 10)
+            effect.setColor(QColor(24, 26, 32, 70))
+            card.setGraphicsEffect(effect)
         outer.addWidget(card)
+        self._surface_card = card
 
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(26, 22, 26, 20)
@@ -145,6 +172,92 @@ class MessageBox(QDialog):
         box = MessageBox(parent, title, text, ok_text="确定", cancel_text="取消")
         box.exec()
         return box.choice
+
+
+class CharacterImportDialog(QDialog):
+    """角色导入预检 + 同名冲突策略（二选一，策略对用户可见）。
+
+    pre 为 Storage.analyze_character_import 的返回值：可导入条数、坏数据计数、
+    与现有数据的同 id / 同名冲突数。确认后才真正写盘。
+    """
+
+    def __init__(self, parent, pre: dict) -> None:
+        super().__init__(parent)
+        self._strategy = "merge"
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setModal(True)
+        self.setFixedWidth(430)
+
+        from app.ui.motion import card_surface
+
+        layout = card_surface(self, gutter=28, readable=True)
+        card = self._surface_card
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("导入角色 JSON", card)
+        title.setObjectName("MsgTitle")
+        layout.addWidget(title)
+
+        valid_chars = len(pre.get("valid_characters") or [])
+        valid_rels = len(pre.get("valid_relations") or [])
+        skipped_chars = int(pre.get("skipped_characters") or 0)
+        skipped_rels = int(pre.get("skipped_relations") or 0)
+        summary = QLabel(
+            f"文件版本：v{int(pre.get('version') or 1)}　现有角色：{pre.get('existing_characters', 0)}\n"
+            f"可导入：{valid_chars} 名角色、{valid_rels} 条关系\n"
+            f"坏数据已跳过：角色 {skipped_chars} 条、关系 {skipped_rels} 条",
+            card,
+        )
+        summary.setObjectName("MsgText")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        conflict_id = int(pre.get("conflict_id") or 0)
+        conflict_name = int(pre.get("conflict_name") or 0)
+        if conflict_id or conflict_name:
+            hint = QLabel(
+                f"检测到冲突：同 id {conflict_id} 个、同名 {conflict_name} 个。请选择处理方式：",
+                card,
+            )
+            hint.setObjectName("MsgText")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+            self.rb_merge = QRadioButton("同 id / 同名合并更新（推荐）", card)
+            self.rb_merge.setChecked(True)
+            self.rb_merge.toggled.connect(
+                lambda on: setattr(self, "_strategy", "merge") if on else None
+            )
+            layout.addWidget(self.rb_merge)
+            merge_hint = QLabel("保留现有角色 id 与创建时间，用导入内容覆盖字段。", card)
+            merge_hint.setObjectName("DrawerHint")
+            layout.addWidget(merge_hint)
+
+            self.rb_skip = QRadioButton("同名角色跳过（保留现有数据）", card)
+            self.rb_skip.toggled.connect(
+                lambda on: setattr(self, "_strategy", "skip") if on else None
+            )
+            layout.addWidget(self.rb_skip)
+            skip_hint = QLabel("冲突条目不写入，导入完成时会提示跳过条数。", card)
+            skip_hint.setObjectName("DrawerHint")
+            layout.addWidget(skip_hint)
+        else:
+            layout.addWidget(QLabel("未发现同 id / 同名冲突，将直接新增到角色页。", card))
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = _ghost("取消", card)
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        ok = _primary("开始导入", card)
+        ok.clicked.connect(self.accept)
+        row.addWidget(ok)
+        layout.addLayout(row)
+
+    def strategy(self) -> str:
+        return self._strategy
 
 
 class CoverPickBox(QPushButton):
@@ -194,10 +307,16 @@ class CoverPickBox(QPushButton):
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(rect, 8, 8)
             painter.setPen(QPen(QColor("#8A9099")))
+            # ＋ 用全站统一矢量图标（不再用文字字形）
+            from app.ui.icons import IconFactory
+
+            plus = IconFactory("#8A9099").pixmap("add", 26, dpr=self.devicePixelRatioF())
+            painter.drawPixmap(
+                int((self.width() - plus.width() / plus.devicePixelRatio()) / 2),
+                int(self.height() / 2 - 30),
+                plus,
+            )
             font = QFont(self.font())
-            font.setPixelSize(26)
-            painter.setFont(font)
-            painter.drawText(rect.adjusted(0, -18, 0, -18), Qt.AlignCenter, "＋")
             font.setPixelSize(11)
             painter.setFont(font)
             painter.drawText(rect.adjusted(0, 30, 0, 8), Qt.AlignHCenter | Qt.AlignTop, "添加封面")
@@ -326,19 +445,12 @@ class FontDialog(QDialog):
         self.setModal(True)
         self.setFixedWidth(372)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(28, 28, 28, 28)   # 给阴影留出空间
+        # 文字密集弹层：玻璃风下外壳保持原值（本体膜 0.55–0.72），
+        # 内部嵌入 10px 内缩内容板；非玻璃风仍是实色 QFrame。
+        from app.ui.motion import card_surface
 
-        card = QFrame(self)
-        card.setObjectName("MessageBox")
-        effect = QGraphicsDropShadowEffect(card)   # 构造时挂一次（静态安全）
-        effect.setBlurRadius(36)
-        effect.setOffset(0, 10)
-        effect.setColor(QColor(24, 26, 32, 70))
-        card.setGraphicsEffect(effect)
-        outer.addWidget(card)
-
-        layout = QVBoxLayout(card)
+        layout = card_surface(self, gutter=28, readable=True)
+        card = self._surface_card
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(12)
 
@@ -348,9 +460,7 @@ class FontDialog(QDialog):
         title.setObjectName("MsgTitle")
         head.addWidget(title)
         head.addStretch(1)
-        close_button = _ghost("×", card)
-        close_button.setFixedSize(30, 30)
-        close_button.setToolTip("关闭（不保存修改）")
+        close_button = _close_icon_button(card, "关闭（不保存修改）")
         close_button.clicked.connect(self.reject)
         head.addWidget(close_button)
         layout.addLayout(head)
@@ -361,6 +471,7 @@ class FontDialog(QDialog):
         layout.addWidget(cap_font)
         self.family_combo = QComboBox(card)
         self._fill_family_combo(str(family or ""))
+        self._opaque_combo_popup(self.family_combo)
         layout.addWidget(self.family_combo)
 
         # ---- 大小与颜色 ----
@@ -371,6 +482,7 @@ class FontDialog(QDialog):
         size_row.setSpacing(8)
         self.size_combo = QComboBox(card)
         self._fill_size_combo(float(size))
+        self._opaque_combo_popup(self.size_combo)
         size_row.addWidget(self.size_combo, 1)
         self.color_button = QToolButton(card)
         self.color_button.setObjectName("ColorSwatch")
@@ -427,6 +539,33 @@ class FontDialog(QDialog):
         self.italic_button.toggled.connect(self._emit_live)
         self.underline_button.toggled.connect(self._emit_live)
         self._update_swatch()
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _opaque_combo_popup(combo: QComboBox) -> None:
+        """字体弹层特例：下拉列表给近实底（玻璃风 $panel 半透明会透出正文）。
+
+        颜色取应用调色板（随深浅 / 品牌色），hover/选中态保留；只作用于
+        字体对话框内的两个下拉，不触碰全局 QSS 与其它弹窗。
+        """
+        pal = QApplication.palette()
+        bg = pal.color(QPalette.ColorRole.Window).name()
+        fg = pal.color(QPalette.ColorRole.WindowText).name()
+        sel_bg = pal.color(QPalette.ColorRole.Highlight).name()
+        sel_fg = pal.color(QPalette.ColorRole.HighlightedText).name()
+        border = QColor(sel_bg)
+        border.setAlpha(90)
+        combo.view().setStyleSheet(
+            f"QAbstractItemView {{"
+            f" background: {bg}; color: {fg}; border: 1px solid {border.name()};"
+            " border-radius: 8px; padding: 4px; outline: 0; }\n"
+            "QAbstractItemView::item {"
+            " min-height: 26px; padding: 5px 10px; border-radius: 6px; }\n"
+            f"QAbstractItemView::item:hover {{ background: {sel_bg}; "
+            "color: white; }\n"
+            f"QAbstractItemView::item:selected {{ background: {sel_bg};"
+            f" color: {sel_fg}; }}"
+        )
 
     # ------------------------------------------------------------------
     def _fill_family_combo(self, family: str) -> None:
@@ -885,6 +1024,9 @@ class GlobalSearchDialog(QDialog):
         self.preview.setObjectName("Preview")
         self.preview.setReadOnly(True)
         self.preview.setFixedHeight(92)
+        from app.ui.scroll_float import attach_flasher
+
+        attach_flasher(self.preview, Qt.Vertical, inset=6)
         layout.addWidget(self.preview)
 
         bottom = QHBoxLayout()
@@ -1011,6 +1153,9 @@ class HistoryDialog(QDialog):
         self.preview.setObjectName("Preview")
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText("选择左侧版本后，这里会显示当时的正文。")
+        from app.ui.scroll_float import attach_flasher
+
+        attach_flasher(self.preview, Qt.Vertical, inset=6)
         layout.addWidget(self.preview, 1)
 
         self.restore_button = _primary("恢复此版本", self)
@@ -1078,18 +1223,29 @@ class NameGeneratorDialog(QDialog):
         self._subtype = "any"
         self._style = "cn"
         self._drag_pos: QPoint | None = None
+        # 每类的状态缓存：候选 / 选中 / 筛选条件（对话框实例复用，重开不丢）
+        self._kind_state: dict[str, dict] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 28, 28, 28)   # 给阴影留出空间
 
-        card = QFrame(self)
-        card.setObjectName("MessageBox")
-        effect = QGraphicsDropShadowEffect(card)
-        effect.setBlurRadius(36)
-        effect.setOffset(0, 10)
-        effect.setColor(QColor(24, 26, 32, 70))
-        card.setGraphicsEffect(effect)
+        from app.ui import surface as _surface
+
+        if _surface.is_glass():
+            # 起名助手是文字最密集的浮层：外壳玻璃原样 + 内嵌内容板，正文不透上来
+            card = _surface.ReadableCard(14.0, self)
+            from app.ui.motion import apply_elevation, app_is_dark
+            apply_elevation(card, 1, app_is_dark())
+        else:
+            card = QFrame(self)
+            card.setObjectName("MessageBox")
+            effect = QGraphicsDropShadowEffect(card)
+            effect.setBlurRadius(36)
+            effect.setOffset(0, 10)
+            effect.setColor(QColor(24, 26, 32, 70))
+            card.setGraphicsEffect(effect)
         outer.addWidget(card)
+        self._surface_card = card
 
         root = QVBoxLayout(card)
         root.setContentsMargins(22, 16, 18, 18)
@@ -1102,9 +1258,7 @@ class NameGeneratorDialog(QDialog):
         title.setObjectName("MsgTitle")
         head.addWidget(title)
         head.addStretch(1)
-        close_button = _ghost("×", card)
-        close_button.setFixedSize(30, 30)
-        close_button.setToolTip("关闭")
+        close_button = _close_icon_button(card, "关闭")
         close_button.clicked.connect(self.reject)
         head.addWidget(close_button)
         root.addLayout(head)
@@ -1216,10 +1370,54 @@ class NameGeneratorDialog(QDialog):
         body.addLayout(right, 1)
 
         root.addLayout(body, 1)
+
+        # ---- 底部操作条：显式关闭入口（图标 + 文案；Esc 等价）----
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 2, 0, 0)
+        esc_hint = QLabel("Esc 快速关闭", card)
+        esc_hint.setObjectName("DrawerHint")
+        action_row.addWidget(esc_hint)
+        action_row.addStretch(1)
+        self.clear_button = _ghost("清空候选", card)
+        self.clear_button.setToolTip("清空当前分类已生成的候选与选中名字")
+        self.clear_button.clicked.connect(self.clear_candidates)
+        action_row.addWidget(self.clear_button)
+        self.close_action = _primary("关闭", card)
+        self.close_action.setMinimumWidth(112)
+        self.close_action.setFixedHeight(38)
+        self.close_action.setToolTip("关闭并返回（Esc）")
+        self.close_action.clicked.connect(self.reject)
+        action_row.addWidget(self.close_action)
+        root.addLayout(action_row)
+
         self.toast = ToastLabel(card)
 
         self._rebuild_subtype_chips()
         self.generate()
+        self._refresh_icons()
+
+    # ------------------------------------------------------------------
+    # 主题化图标（每次显示时按当前调色板刷新，深浅主题切换后仍清晰）
+    # ------------------------------------------------------------------
+    def _refresh_icons(self) -> None:
+        from app.ui.icons import IconFactory
+
+        text_color = self.palette().windowText().color().name()
+        self.clear_button.setIcon(IconFactory(text_color).icon("trash", 16))
+        # 主色按钮上的图标用 on_accent 白色，保证对比
+        self.close_action.setIcon(IconFactory("#FFFFFF").icon("close", 16))
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._refresh_icons()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        # 无边框窗口没有原生标题栏，Esc 显式兜底为关闭
+        if event.key() == Qt.Key_Escape:
+            self.reject()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ------------------------------------------------------------------
     # 拖动：按住卡片空白处 / 标题栏即可移动窗口
@@ -1239,14 +1437,44 @@ class NameGeneratorDialog(QDialog):
         super().mouseReleaseEvent(event)
 
     # ------------------------------------------------------------------
+    def _new_state(self) -> dict:
+        return {"names": [], "selected": set(), "subtype": "any",
+                "style": "cn", "surname": "", "given": "", "suffix": ""}
+
+    def _snapshot_filters(self) -> None:
+        """把当前筛选条件记入本类缓存（切走前调用）。"""
+        st = self._kind_state.setdefault(self._kind, self._new_state())
+        st["subtype"] = self._subtype
+        st["style"] = self._style
+        st["surname"] = self.surname_edit.text()
+        st["given"] = self.given_edit.text()
+        st["suffix"] = self.suffix_edit.text()
+
     def _switch_kind(self, key: str) -> None:
+        if key == self._kind:
+            return
+        self._snapshot_filters()
         self._kind = key
-        self._subtype = self.SUBTYPES[key][0][0]
+        st = self._kind_state.get(key)
+        if st is None:
+            st = self._new_state()
+            st["subtype"] = self.SUBTYPES[key][0][0]
+            self._kind_state[key] = st
+        self._subtype = st["subtype"]
+        self._style = st["style"]
         for k, button in self._tab_buttons.items():
             button.setChecked(k == key)
+        for k, button in self._style_buttons.items():
+            button.setChecked(k == self._style)
+        self.surname_edit.setText(st["surname"])
+        self.given_edit.setText(st["given"])
+        self.suffix_edit.setText(st["suffix"])
         self._rebuild_subtype_chips()
         self._person_extra.setVisible(key == "person")
-        self.generate()
+        if st["names"]:
+            self._populate(st["names"])
+        else:
+            self.generate()
 
     def _rebuild_subtype_chips(self) -> None:
         """按当前页签重建「类型」子筛选胶囊。"""
@@ -1295,6 +1523,23 @@ class NameGeneratorDialog(QDialog):
             suffix=self.suffix_edit.text(),
             count=self.COUNT,
         )
+        # 记入本类缓存（候选与当前筛选条件），切走再回来时原样恢复
+        st = self._kind_state.setdefault(self._kind, self._new_state())
+        st.update(
+            subtype=self._subtype, style=self._style,
+            surname=self.surname_edit.text(), given=self.given_edit.text(),
+            suffix=self.suffix_edit.text(), names=list(names),
+        )
+        self._populate(names)
+
+    def clear_candidates(self) -> None:
+        """用户主动清空：本类候选与选中都清掉（筛选条件保留）。"""
+        st = self._kind_state.setdefault(self._kind, self._new_state())
+        st["names"] = []
+        st["selected"] = set()
+        self._populate([])
+
+    def _populate(self, names: list[str]) -> None:
         # 清空旧结果
         while self._grid.count():
             item = self._grid.takeAt(0)
@@ -1302,18 +1547,38 @@ class NameGeneratorDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
 
+        selected = self._kind_state.get(self._kind, {}).get("selected", set())
         for index, name in enumerate(names):
             chip = QPushButton(name, self._grid_widget)
             chip.setObjectName("NameChip")
+            chip.setCheckable(True)
+            chip.setChecked(name in selected)
             chip.setCursor(Qt.PointingHandCursor)
             chip.setMinimumHeight(36)
-            chip.setToolTip("点击复制")
-            chip.clicked.connect(lambda _c=False, n=name: self._copy(n))
+            chip.setToolTip("点击复制；再点一次可标记 / 取消选中")
+            chip.clicked.connect(lambda _c=False, b=chip, n=name: self._on_chip(b, n))
             row, col = divmod(index, self.COLUMNS)
             self._grid.addWidget(chip, row, col)
         for col in range(self.COLUMNS):
             self._grid.setColumnStretch(col, 1)
-        self.result_hint.setText(f"已生成 {len(names)} 个名字 · 点击即可复制")
+        if names:
+            picked = len(selected)
+            tail = f" · 已选 {picked} 个" if picked else ""
+            self.result_hint.setText(f"已生成 {len(names)} 个名字 · 点击即可复制{tail}")
+        else:
+            self.result_hint.setText("暂无候选 · 点击左侧「生成」")
+
+    def _on_chip(self, chip: QPushButton, name: str) -> None:
+        st = self._kind_state.setdefault(self._kind, self._new_state())
+        selected = st.setdefault("selected", set())
+        if chip.isChecked():
+            selected.add(name)
+        else:
+            selected.discard(name)
+        picked = len(selected)
+        tail = f" · 已选 {picked} 个" if picked else ""
+        self.result_hint.setText(f"已生成 {len(st.get('names', []))} 个名字 · 点击即可复制{tail}")
+        self._copy(name)
 
     def _copy(self, name: str) -> None:
         QApplication.clipboard().setText(name)
@@ -1456,12 +1721,25 @@ class StatsDialog(QDialog):
         cal_layout.setContentsMargins(18, 14, 18, 14)
         cal_layout.setSpacing(10)
         cal_header = QHBoxLayout()
-        self.prev_button = _ghost("‹", cal_card)
+        self.prev_button = _ghost("", cal_card)
         self.prev_button.setFixedSize(34, 30)
+        self.prev_button.setToolTip("上一个月")
+        self.prev_button.setAccessibleName("上一个月")
+        self.prev_button.setCursor(Qt.PointingHandCursor)
         self.prev_button.clicked.connect(lambda: self._shift_month(-1))
-        self.next_button = _ghost("›", cal_card)
+        self.next_button = _ghost("", cal_card)
         self.next_button.setFixedSize(34, 30)
+        self.next_button.setToolTip("下一个月")
+        self.next_button.setAccessibleName("下一个月")
+        self.next_button.setCursor(Qt.PointingHandCursor)
         self.next_button.clicked.connect(lambda: self._shift_month(1))
+        _nav_ink = QApplication.palette().windowText().color().name()
+        from app.ui.icons import IconFactory
+
+        self.prev_button.setIcon(IconFactory(_nav_ink).icon("left", 16))
+        self.next_button.setIcon(IconFactory(_nav_ink).icon("right", 16))
+        self.prev_button.setIconSize(QSize(16, 16))
+        self.next_button.setIconSize(QSize(16, 16))
         self.month_label = QLabel("", cal_card)
         self.month_label.setObjectName("NameGenTitle")
         self.month_label.setAlignment(Qt.AlignCenter)
@@ -1647,84 +1925,6 @@ class AchievementToast(QDialog):
         super().mousePressEvent(event)
 
 
-class SpeedDialog(QDialog):
-    """码字时速实时面板。"""
-
-    def __init__(self, tracker, parent=None) -> None:
-        super().__init__(parent)
-        self.tracker = tracker
-        self.setWindowTitle("码字时速")
-        self.setModal(False)
-        self.resize(380, 300)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 18)
-        layout.setSpacing(12)
-
-        card = QFrame(self)
-        card.setObjectName("EditorPaper")
-        form = QFormLayout(card)
-        form.setContentsMargins(22, 18, 22, 18)
-        form.setSpacing(12)
-        self.session_label = QLabel("0 字", card)
-        self.time_label = QLabel("0 秒", card)
-        self.speed_label = QLabel("暂无数据", card)
-        self.recent_label = QLabel("暂无数据", card)
-        for key, value in (
-            ("本次会话码字", self.session_label),
-            ("有效写作时长", self.time_label),
-            ("平均时速", self.speed_label),
-            ("最近一分钟", self.recent_label),
-        ):
-            label = QLabel(key, card)
-            label.setObjectName("DrawerHint")
-            form.addRow(label, value)
-        layout.addWidget(card)
-
-        hint = QLabel("连续两分钟没有输入会暂停计时，挂机时间不计入。", self)
-        hint.setObjectName("DrawerHint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        bottom = QHBoxLayout()
-        reset_button = _ghost("重置本次统计", self)
-        reset_button.clicked.connect(self._reset)
-        close_button = _primary("关闭", self)
-        close_button.clicked.connect(self.close)
-        bottom.addWidget(reset_button)
-        bottom.addStretch(1)
-        bottom.addWidget(close_button)
-        layout.addLayout(bottom)
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(1000)
-        self._timer.timeout.connect(self._refresh)
-        self._timer.start()
-        self._refresh()
-
-    def _refresh(self) -> None:
-        self.session_label.setText(f"{self.tracker.total_chars} 字")
-        self.time_label.setText(self.tracker.elapsed_text)
-        speed = self.tracker.speed_per_hour
-        self.speed_label.setText(f"{int(speed)} 字/小时" if speed > 0 else "暂无数据")
-        recent = self.tracker.recent_speed_per_hour
-        self.recent_label.setText(f"{int(recent)} 字/小时" if recent > 0 else "暂无数据")
-
-    def _reset(self) -> None:
-        self.tracker.reset()
-        self._refresh()
-
-    def showEvent(self, event) -> None:  # noqa: N802
-        """每次重新打开面板时恢复实时刷新（关闭时计时器会停止）。"""
-        super().showEvent(event)
-        self._timer.start()
-        self._refresh()
-
-    def done(self, result: int) -> None:
-        self._timer.stop()
-        super().done(result)
-
-
 class RelatedDialog(QDialog):
     """新增 / 编辑“相关”设定。"""
 
@@ -1758,6 +1958,9 @@ class RelatedDialog(QDialog):
         self.note_edit.setObjectName("Preview")
         self.note_edit.setPlainText(note)
         self.note_edit.setPlaceholderText("人物关系、外貌、背景等……")
+        from app.ui.scroll_float import attach_flasher
+
+        attach_flasher(self.note_edit, Qt.Vertical, inset=6)
         layout.addWidget(self.note_edit, 1)
 
         _add_buttons(self, layout, "保存", self._on_ok)
@@ -1828,6 +2031,9 @@ class NoteEditorWindow(QWidget):
         self.content_edit.setObjectName("Preview")
         self.content_edit.setPlaceholderText("在这里自由书写世界观、人物、力量体系等设定……")
         self.content_edit.setPlainText(str(self.doc.get("content") or ""))
+        from app.ui.scroll_float import attach_flasher
+
+        attach_flasher(self.content_edit, Qt.Vertical, inset=10)
         layout.addWidget(self.content_edit, 1)
 
         self._save_timer = QTimer(self)
@@ -1863,10 +2069,6 @@ class NoteEditorWindow(QWidget):
 
     def _export_txt(self) -> None:
         """把设定内容导出为 TXT 文本（导出路径实时选择）。"""
-        import os
-
-        from PySide6.QtWidgets import QFileDialog
-
         self._save()
         title = str(self.doc.get("title") or "设定")
         path, _f = QFileDialog.getSaveFileName(
@@ -1883,6 +2085,11 @@ class NoteEditorWindow(QWidget):
             MessageBox.warning(self, "导出失败", f"无法写入文件：{exc}")
             return
         MessageBox.information(self, "导出成功", f"已导出到：\n{os.path.abspath(path)}")
+
+    def flush_pending(self) -> None:
+        """主窗口退出前兜底：防抖中的文本立即落盘。"""
+        self._save_timer.stop()
+        self._save()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._save()

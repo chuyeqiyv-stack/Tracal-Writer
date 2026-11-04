@@ -6,9 +6,13 @@ from PySide6.QtCore import (
     QEasingCurve,
     QPoint,
     QPropertyAnimation,
+    QRectF,
+    QSize,
     Qt,
+    QTimer,
     Signal,
 )
+from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -46,6 +50,9 @@ class SettingsDrawer(QWidget):
         self.setObjectName("Drawer")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFixedWidth(self.WIDTH)
+        # 侧边抽屉：2 档浮层阴影（构造时挂一次，避免 enter/leave 动态挂卸闪退）
+        from app.ui import motion
+        motion.apply_elevation(self, 2, motion.app_is_dark())
         self.hide()
 
         self._is_open = False
@@ -53,6 +60,16 @@ class SettingsDrawer(QWidget):
         self._switches: dict[str, ToggleSwitch] = {}
         self._segments: dict[str, SegmentedControl] = {}
         self._colors: dict[str, ColorButton] = {}
+        # 液态玻璃：缓存的背景模糊位图（仅打开 / 尺寸稳定 120–150ms 后重算，绝不每帧）
+        self._backdrop: QPixmap | None = None
+        self._sheen_pos = None
+        self._backdrop_timer = QTimer(self)
+        self._backdrop_timer.setSingleShot(True)
+        self._backdrop_timer.setInterval(135)
+        self._backdrop_timer.timeout.connect(self._rebuild_backdrop)
+        from app.ui import surface
+
+        surface.attach_sheen(self)   # 高光斑 180ms 跟随指针
 
         self._anim = QPropertyAnimation(self, b"pos", self)
         self._anim.setDuration(220)
@@ -71,11 +88,12 @@ class SettingsDrawer(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         title = QLabel("更多设置", self)
         title.setObjectName("DrawerTitle")
-        self.close_button = QPushButton("×", self)
+        self.close_button = QPushButton(self)
         self.close_button.setObjectName("DrawerClose")
         self.close_button.setFixedSize(28, 28)
         self.close_button.setCursor(Qt.PointingHandCursor)
-        self.close_button.setToolTip("关闭设置")
+        self.close_button.setToolTip("关闭设置（Esc）")
+        self.close_button.setAccessibleName("关闭设置")
         self.close_button.clicked.connect(lambda: self.close_drawer())
         header.addWidget(title)
         header.addStretch(1)
@@ -181,9 +199,25 @@ class SettingsDrawer(QWidget):
         self._set_color("accent_color", hex_color)
 
     def _build_sections(self) -> None:
-        # 外观：深浅色 + 品牌主色调 + 独立配色
+        # 外观：风格 + 深浅色 + 品牌主色调 + 独立配色
         section = self._add_section("外观")
         self._add_segment(section, "mode", "深色 / 浅色", [("浅色", "light"), ("深色", "dark")])
+        self._add_segment(
+            section, "ui_style", "外观风格",
+            [("默认", "default"), ("纸感", "paper"), ("玻璃", "glass"), ("秩序", "order")],
+        )
+        self._add_segment(
+            section, "glass_mode", "玻璃质感",
+            [("立体玻璃块", "block"), ("液态玻璃", "liquid"), ("磨砂雾面", "frosted")],
+        )
+        self._add_switch(
+            section, "glass_blur", "玻璃背景模糊",
+            "外观风格选「玻璃」时，对抽屉 / 对话框背后的内容做高斯模糊；关闭后仅保留半透明玻璃面，可在低配置设备上提升流畅度。",
+        )
+        self._add_switch(
+            section, "boot_animation", "启动莲花动画",
+            "启动时播放约 0.6 秒的黑白线稿莲花绽放，点击或按任意键可跳过；与加载并行不拖慢启动。",
+        )
         self._add_color(
             section, "accent_color", "品牌主色调",
             "按钮、选中目录项与焦点边框都会使用此颜色，留空跟随默认主题。",
@@ -308,6 +342,9 @@ class SettingsDrawer(QWidget):
         version_label = QLabel(f"版本 {config.APP_VERSION} · 纯本地单机写作软件", section.parentWidget())
         version_label.setObjectName("DrawerHint")
         section.addWidget(version_label)
+        author_label = QLabel("设计与开发：夜夜笙歌林夜歌 · AI 协作", section.parentWidget())
+        author_label.setObjectName("DrawerHint")
+        section.addWidget(author_label)
 
     # ------------------------------------------------------------------
     def _set_value(self, field: str, value) -> None:
@@ -392,14 +429,65 @@ class SettingsDrawer(QWidget):
     # ------------------------------------------------------------------
     # 抽屉动画
     # ------------------------------------------------------------------
-    def is_open(self) -> bool:
-        return self._is_open
-
     def toggle(self) -> None:
         if self._is_open:
             self.close_drawer()
         else:
             self.open_drawer()
+
+    def _rebuild_backdrop(self) -> None:
+        """液态玻璃：抓取背后主内容区并模糊一次（缓存到下次开合 / 尺寸变化）。"""
+        from app.ui import surface
+
+        self._backdrop = None
+        if not surface.is_glass():
+            self.update()
+            return
+        # 关闭「玻璃背景模糊」设置：只保留半透明本体，不抓不糊
+        if not surface.blur_enabled():
+            self.update()
+            return
+        parent = self.parentWidget()
+        if parent is None or not self._is_open:
+            return
+        origin = QPoint(max(0, parent.width() - self.WIDTH), self.TOP_INSET)
+        raw = surface.grab_behind(self, parent, origin=origin)
+        self._backdrop = surface.blur_pixmap(raw, surface.blur_sigma())
+        self.update()
+
+    def set_backdrop(self, pixmap: QPixmap | None) -> None:
+        self._backdrop = pixmap
+
+    def refresh_surface(self) -> None:
+        """apply_theme 后调用：质感令牌已变，失效缓存并重画。"""
+        if self._is_open:
+            self._rebuild_backdrop()
+        else:
+            self._backdrop = None
+        self.update()
+
+    def refresh_icons(self, factory) -> None:
+        """主题切换后重设关闭图标颜色（14px，跟随文字令牌）。"""
+        self.close_button.setIconSize(QSize(14, 14))
+        self.close_button.setIcon(factory.icon("close", 14))
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        from app.ui import surface
+
+        if surface.is_glass():
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            # 玻璃风抽屉：左侧圆角 14，右侧贴屏边；用缓存模糊位图 + 着色 + 边缘光学
+            r = QRectF(self.rect())
+            painter.save()
+            painter.setClipRect(self.rect())
+            surface.paint_liquid_sheet(
+                painter, r, float(surface.card_radius()), self._backdrop,
+                getattr(self, "_sheen_pos", None), readable=True)
+            painter.restore()
+            painter.end()
+        else:
+            super().paintEvent(event)
 
     def open_drawer(self, animate: bool = True) -> None:
         parent = self.parentWidget()
@@ -411,6 +499,8 @@ class SettingsDrawer(QWidget):
         self.setGeometry(
             parent.width() - self.WIDTH, top, self.WIDTH, parent.height() - top
         )
+        # 液态玻璃：必须在自身 show() 之前抓背景，避免把抽屉自己拍进快照
+        self._rebuild_backdrop()
         target = QPoint(parent.width() - self.WIDTH, top)
         self._anim.stop()
         self.show()
@@ -445,6 +535,8 @@ class SettingsDrawer(QWidget):
     def _on_anim_finished(self) -> None:
         if not self._is_open:
             self.hide()
+            self._backdrop_timer.stop()
+            self._backdrop = None
 
     def relayout(self) -> None:
         """主窗口尺寸变化时重新贴合右侧。"""
@@ -454,6 +546,10 @@ class SettingsDrawer(QWidget):
         top = getattr(self, "TOP_INSET", 0)
         self.setFixedHeight(parent.height() - top)
         if self._is_open:
+            self.setGeometry(parent.width() - self.WIDTH, top, self.WIDTH,
+                             parent.height() - top)
             self.move(parent.width() - self.WIDTH, top)
+            # 尺寸连续变化时防抖，稳定后只重抓 / 模糊一次
+            self._backdrop_timer.start()
         else:
             self.move(parent.width(), top)

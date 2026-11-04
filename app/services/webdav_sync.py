@@ -43,8 +43,11 @@ def _build_client(settings: Settings):
         raise WebDavError(f"WebDAV 客户端初始化失败：{exc}") from exc
 
 
+_COVER_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
 def make_backup_bytes(base_dir: Path) -> bytes:
-    """把数据目录里的 JSON 文件打包成内存中的 zip。"""
+    """把数据目录里的 JSON 与 covers/ 封面图打包成内存中的 zip。"""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(base_dir.rglob("*.json")):
@@ -52,20 +55,34 @@ def make_backup_bytes(base_dir: Path) -> bytes:
                 continue
             arcname = path.relative_to(base_dir).as_posix()
             zf.write(path, arcname)
+        # 任务G：封面原图随备份一起走（jpg/png 已压缩，STORED 避免二次压缩开销）
+        covers = base_dir / "covers"
+        if covers.is_dir():
+            for path in sorted(covers.iterdir()):
+                if path.is_file() and path.suffix.lower() in _COVER_SUFFIXES:
+                    zf.write(path, path.relative_to(base_dir).as_posix(),
+                             compress_type=zipfile.ZIP_STORED)
     return buffer.getvalue()
 
 
 def apply_backup_bytes(base_dir: Path, data: bytes) -> list[str]:
-    """用云端 zip 覆盖本地 JSON 文件，返回恢复的文件列表。"""
+    """用云端 zip 覆盖本地 JSON 与 covers/ 封面，返回恢复的文件列表。"""
     restored: list[str] = []
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        names = [n for n in zf.namelist() if n.endswith(".json") and ".." not in n]
-        for name in names:
-            target = base_dir / name
+        for name in zf.namelist():
+            if ".." in name or name.startswith("/"):
+                continue
+            posix = name.replace("\\", "/")
+            is_json = posix.endswith(".json")
+            is_cover = (posix.startswith("covers/") and "/" not in posix[len("covers/"):]
+                        and Path(posix).suffix.lower() in _COVER_SUFFIXES)
+            if not is_json and not is_cover:
+                continue
+            target = base_dir / posix
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(name) as src, target.open("wb") as dst:
                 dst.write(src.read())
-            restored.append(name)
+            restored.append(posix)
     if not restored:
         raise WebDavError("云端备份包里没有找到任何 JSON 数据文件")
     return restored

@@ -50,11 +50,6 @@ def count_chars(text: str, exclude_punctuation: bool = False) -> int:
     return count
 
 
-def count_paragraphs(text: str) -> int:
-    """统计非空段落数。"""
-    return sum(1 for line in text.splitlines() if line.strip())
-
-
 def format_word_count(count: int) -> str:
     """把字数格式化为易读文本，例如 12.3 万。"""
     if count >= 10000:

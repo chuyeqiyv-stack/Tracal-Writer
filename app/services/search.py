@@ -23,10 +23,6 @@ def find_all(text: str, needle: str, case_sensitive: bool = False) -> list[tuple
     return result
 
 
-def count_matches(text: str, needle: str, case_sensitive: bool = False) -> int:
-    return len(find_all(text, needle, case_sensitive))
-
-
 def replace_all_text(
     text: str, needle: str, replacement: str, case_sensitive: bool = False
 ) -> tuple[str, int]:

@@ -15,7 +15,6 @@ from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QActionGroup, QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -45,6 +44,7 @@ from app.storage import Storage
 from app.ui.bookshelf import BookshelfPage
 from app.ui.dialogs import (
     AchievementToast,
+    CharacterImportDialog,
     FindReplaceDialog,
     FontDialog,
     GlobalSearchDialog,
@@ -111,7 +111,6 @@ class MainWindow(QMainWindow):
         self._other_chars = 0
         self._total_chars = 0
         self._dirty = False
-        self._save_error_shown = False
         self.speed = WritingSpeedTracker()
         self.achievements = AchievementManager(storage)
         self._words_pending = 0          # 尚未落盘的今日键盘打字字数
@@ -125,6 +124,7 @@ class MainWindow(QMainWindow):
 
         self._find_dialog: FindReplaceDialog | None = None
         self._search_dialog: GlobalSearchDialog | None = None
+        self._name_dialog: NameGeneratorDialog | None = None
 
         self.setWindowTitle(config.APP_NAME)
         self.resize(1360, 880)
@@ -138,6 +138,22 @@ class MainWindow(QMainWindow):
         self._ensure_first_run_demo()
         self.apply_theme()
         self.show_bookshelf()
+        # 任务G：封面懒迁移/孤儿扫描延后到首帧之后（不压构造耗时）；有变更再刷书架
+        QTimer.singleShot(0, self._housekeep_covers_deferred)
+
+    def _housekeep_covers_deferred(self) -> None:
+        """首帧后整理 covers/（data-URI 外置 / 旧命名哈希化 / 孤儿清理）。"""
+        try:
+            stats = self.storage.housekeep_covers_once()
+        except OSError:
+            return
+        if stats.get("skipped") or stats.get("error"):
+            return
+        if stats.get("data_uri") or stats.get("legacy_renamed") or stats.get("removed"):
+            from app.ui.widgets import cover_cache_clear
+            cover_cache_clear()
+            if self.book is None:
+                self._update_shelf()
 
     # ==================================================================
     # 字体导入
@@ -170,7 +186,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget(self.root)
 
-        self.shelf = BookshelfPage(self.stack)
+        self.shelf = BookshelfPage(self.stack, storage=self.storage)
         self.stack.addWidget(self.shelf)
 
         self.workspace = QWidget(self.stack)
@@ -204,8 +220,8 @@ class MainWindow(QMainWindow):
         self.side_toggle_button = QPushButton(bar)
         self.side_toggle_button.setObjectName("SideToggle")
         self.side_toggle_button.setCursor(Qt.PointingHandCursor)
-        self.side_toggle_button.setFixedSize(12, 64)
-        self.side_toggle_button.setIconSize(QSize(12, 12))
+        self.side_toggle_button.setFixedSize(14, 64)
+        self.side_toggle_button.setIconSize(QSize(14, 14))
         self.side_toggle_button.clicked.connect(self.toggle_sidebar)
         layout.addWidget(self.side_toggle_button)
         layout.addStretch(1)
@@ -216,7 +232,7 @@ class MainWindow(QMainWindow):
         factory = getattr(self, "_icon_factory", None)
         visible = self.sidebar.isVisible()
         if factory is not None:
-            self.side_toggle_button.setIcon(factory.icon("left" if visible else "right", 12))
+            self.side_toggle_button.setIcon(factory.icon("left" if visible else "right", 14))
         self.side_toggle_button.setToolTip("收起目录" if visible else "展开目录")
 
     def _build_homebar(self) -> QWidget:
@@ -401,7 +417,12 @@ class MainWindow(QMainWindow):
         self.shelf.rename_outline_requested.connect(self.rename_outline)
         self.shelf.delete_outline_requested.connect(self.delete_outline)
 
-        # 世界地图（可创建多张）与导出
+        # 角色（角色卡 + 内嵌关系图，书架页管理）
+        self.shelf.new_character_requested.connect(self.new_character)
+        self.shelf.character_view_changed.connect(self._on_character_view_changed)
+        self.shelf.characters_changed.connect(self._update_shelf)
+
+        # 地图（可创建多张）与导出
         self.shelf.open_map_requested.connect(self.open_map)
         self.shelf.new_map_requested.connect(self.new_map)
         self.shelf.rename_map_requested.connect(self.rename_map)
@@ -415,6 +436,7 @@ class MainWindow(QMainWindow):
         self.shelf.import_note_requested.connect(self.import_note)
         self.shelf.import_timeline_requested.connect(self.import_timeline)
         self.shelf.import_outline_requested.connect(self.import_outline)
+        self.shelf.import_characters_requested.connect(self.import_characters)
         self.shelf.import_map_requested.connect(self.import_map)
 
         # 成就：成就页右键设置展示勋章
@@ -440,8 +462,9 @@ class MainWindow(QMainWindow):
         self.editor_page.speed_panel_toggled.connect(
             self.buttons["speed"].setChecked
         )
-        # 时速面板切换单位后立即持久化
+        # 时速面板切换单位 / 统计开关后立即持久化
         self.editor_page.speed_panel.unit_changed.connect(self._on_speed_unit_changed)
+        self.editor_page.speed_panel.tracking_changed.connect(self._on_speed_tracking_changed)
         # 正文右键：段落设置 / 智能排版
         self.editor_page.paragraph_settings_requested.connect(self.show_paragraph_dialog)
         self.editor_page.smart_format_requested.connect(self.smart_format)
@@ -489,23 +512,39 @@ class MainWindow(QMainWindow):
         """根据设置重建调色板、QSS、图标与各处颜色。"""
         theme = build_theme(self.settings)
         self._theme = theme
+        # 外观风格的浮层阴影令牌同步给 motion（在构建任何浮层前生效）
+        from app.ui import motion
+        motion.set_elevation_tokens(theme)
+        # 玻璃质感覆层的圆角跟随风格令牌
+        from app.ui.widgets import set_ui_radius
+        set_ui_radius(theme.get("radius", 8))
+        # 表面质感引擎（液态玻璃 / 磨砂哑光）同步当前令牌与模糊开关
+        from app.ui import surface
+        surface.set_surface_state(theme)
+        surface.set_glass_mode(str(getattr(self.settings, "glass_mode", "block")))
+        surface.set_blur_enabled(bool(getattr(self.settings, "glass_blur", True)))
 
         app = QApplication.instance()
         if app is not None:
             app.setPalette(build_palette(theme))
             app.setStyleSheet(build_qss(theme))
 
-        self._icon_factory = IconFactory(theme["icon"])
+        self._icon_factory = IconFactory(theme["icon"], active_color=theme["accent"])
         self._refresh_icons()
         self.root.set_theme(theme)
         self.editor_page.apply_settings(self.settings)
         self.editor_page.apply_writing_background()
         self.drawer.refresh_values()
         self.drawer.repaint_switches()
+        self.drawer.refresh_surface()
         self._update_shelf()
         for dialog in self._map_dialogs.values():
             if dialog.isVisible():
                 dialog.set_theme(theme)
+        # 角色面板在数据计数未变时会跳过 _render，这里显式把主题送进去（含内嵌画布）
+        panel = self.shelf.characters_view()
+        if panel is not None:
+            panel.set_theme(theme)
 
     def _refresh_icons(self) -> None:
         factory = self._icon_factory
@@ -513,13 +552,25 @@ class MainWindow(QMainWindow):
         for button in self.buttons.values():
             name = str(button.property("icon_name") or "")
             if name:
-                button.set_icon(factory.icon(name, 20))
+                button.set_icon_spec(factory, name, 20)
             button.set_theme(theme)
         for button in getattr(self, "home_buttons", {}).values():
             name = str(button.property("icon_name") or "")
             if name:
-                button.set_icon(factory.icon(name, 20))
+                button.set_icon_spec(factory, name, 20)
             button.set_theme(theme)
+        # 侧边栏导航（普通 QPushButton，QSS 样式；选中态换 accent 图标）
+        shelf = getattr(self, "shelf", None)
+        nav = getattr(shelf, "nav", None)
+        if nav is not None:
+            nav.refresh_icons(factory)
+        # CTA 主按钮在 accent 底上，用 on_accent 色
+        if shelf is not None and hasattr(shelf, "refresh_icons"):
+            shelf.refresh_icons(IconFactory(theme["on_accent"],
+                                             active_color=theme["on_accent"]))
+        # 设置抽屉关闭钮
+        if getattr(self, "drawer", None) is not None:
+            self.drawer.refresh_icons(factory)
         self._update_side_toggle_arrow()
         self.editor_page.refresh_icons(factory)
 
@@ -569,6 +620,16 @@ class MainWindow(QMainWindow):
         self.shelf.set_timelines(library.get("timelines", []))
         self.shelf.set_notes(library.get("notes", []))
         self.shelf.set_outlines(library.get("outlines", []))
+        self.shelf.set_characters(
+            self.storage.load_characters(),
+            self.storage.load_relations(),
+            self._theme,
+            self.settings.character_view,
+        )
+        # 角色导出文件名 / 文件头使用当前作品名（面板未创建时不触发创建）
+        panel = self.shelf.characters_panel()
+        if panel is not None:
+            panel.book_name = self.book.title if self.book is not None else ""
         self.shelf.set_maps(self.storage.load_maps())
         self.shelf.set_achievements(self.achievements.unlocked)
         self.shelf.set_showcase(self.settings.showcase_medal)
@@ -1289,8 +1350,10 @@ class MainWindow(QMainWindow):
         self.apply_theme()
 
     def show_name_dialog(self) -> None:
-        dialog = NameGeneratorDialog(self)
-        dialog.exec()
+        # 复用同一实例：候选、选中名字与各分类筛选条件跨打开保留
+        if self._name_dialog is None:
+            self._name_dialog = NameGeneratorDialog(self)
+        self._name_dialog.exec()
 
     # ==================================================================
     # 独立时间轴（可创建多个，从书架打开）
@@ -1304,6 +1367,16 @@ class MainWindow(QMainWindow):
         self.open_timeline(str(item["id"]))
 
     def open_timeline(self, timeline_id: str) -> None:
+        # 同一时间轴只保留一个窗口：重复点卡片时把旧窗口前置。
+        # 否则两个窗口各持一份旧 item，后关闭的那个会把新窗口保存的事件覆盖回旧版。
+        for dialog in list(self._timeline_dialogs):
+            if dialog.item.get("id") == timeline_id:
+                if dialog.isMinimized():
+                    dialog.showNormal()
+                dialog.show()
+                dialog.raise_()
+                dialog.activateWindow()
+                return
         item = self.storage.load_timeline(timeline_id)
         if item is None:
             return
@@ -1469,10 +1542,92 @@ class MainWindow(QMainWindow):
         self._update_shelf()
 
     # ==================================================================
-    # 世界地图（可创建多张，独立保存为 map_global.json）
+    # 角色卡 + 角色关系思维导图（视图内嵌在角色页）
+    # ==================================================================
+    def new_character(self) -> None:
+        """新建角色卡：切到角色页并弹出表单。"""
+        self.shelf.nav.set_page("characters")
+        panel = self.shelf.characters_view()
+        if panel is not None:
+            panel.add_character()
+
+    def _on_character_view_changed(self, view: str) -> None:
+        """记住角色页上次停留的视图（列表 / 关系图）。"""
+        if view not in ("list", "board"):
+            return
+        if self.settings.character_view == view:
+            return
+        self.settings.character_view = view
+        self.storage.save_settings(self.settings)
+
+
+    def import_characters(self) -> None:
+        """导入角色 JSON：读文件 → 预检 → 冲突策略二选一 → 写盘 → 汇报。"""
+        path = self._pick_open_file("导入角色", "JSON 文件 (*.json);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            MessageBox.warning(self, "导入失败", f"无法读取文件：{exc}")
+            return
+        if size > 30 * 1024 * 1024:
+            MessageBox.warning(
+                self, "导入失败",
+                f"文件过大（{size / 1024 / 1024:.1f} MB），角色 JSON 不应超过 30 MB。",
+            )
+            return
+        try:
+            raw = Path(path).read_bytes()
+            # utf-8-sig：兼容本软件导出的带 BOM 文件与普通 UTF-8
+            data = json.loads(raw.decode("utf-8-sig"))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            MessageBox.warning(self, "导入失败", f"无法读取文件：{exc}")
+            return
+        if not (isinstance(data, dict) and isinstance(data.get("characters"), list)):
+            MessageBox.warning(self, "导入失败", "这不是本软件导出的角色文件。")
+            return
+        pre = self.storage.analyze_character_import(data)
+        if not (pre["valid_characters"] or pre["valid_relations"]):
+            MessageBox.warning(
+                self, "导入失败",
+                f"文件里没有可导入的有效数据。\n"
+                f"坏数据：角色 {pre['skipped_characters']} 条、"
+                f"关系 {pre['skipped_relations']} 条。",
+            )
+            return
+        dialog = CharacterImportDialog(self, pre)
+        if dialog.exec() != CharacterImportDialog.Accepted:
+            return
+        report = self.storage.import_character_board(data, dialog.strategy())
+        self._update_shelf()
+        panel = self.shelf.characters_panel()
+        if panel is not None:
+            panel.reload()
+        lines = [
+            f"新增角色 {report['added_characters']} 名，"
+            f"更新 {report['updated_characters']} 名，"
+            f"跳过冲突 {report['skipped_conflicts']} 名；",
+            f"新增关系 {report['added_relations']} 条，"
+            f"重复跳过 {report['duplicate_relations']} 条，"
+            f"坏/悬空/自环剔除 {report['dropped_relations']} 条；",
+        ]
+        if report["skipped_characters"] or report["skipped_relations"]:
+            lines.append(
+                f"坏数据跳过：角色 {report['skipped_characters']} 条、"
+                f"关系 {report['skipped_relations']} 条；"
+            )
+        lines.append(
+            f"画布 {report['board_width']}×{report['board_height']}，"
+            f"重排节点 {report['reflowed_characters']} 个。"
+        )
+        MessageBox.information(self, "导入完成", "\n".join(lines))
+
+    # ==================================================================
+    # 地图（可创建多张，独立保存为 map_global.json）
     # ==================================================================
     def new_map(self) -> None:
-        text, ok = QInputDialog.getText(self, "新建世界地图", "地图名称：")
+        text, ok = QInputDialog.getText(self, "新建地图", "地图名称：")
         if not (ok and text.strip()):
             return
         item = self.storage.add_map(text.strip())
@@ -1782,7 +1937,13 @@ class MainWindow(QMainWindow):
         self.editor_page.toggle_speed_panel()
 
     def _on_speed_unit_changed(self, unit: str) -> None:
-        self.settings.speed_unit = unit
+        # v3：速度单位 char 字/分 / hour 字/时
+        if unit in ("char", "hour"):
+            self.settings.speed_unit_scale = unit
+        self.storage.save_settings(self.settings)
+
+    def _on_speed_tracking_changed(self, on: bool) -> None:
+        self.settings.speed_tracking = bool(on)
         self.storage.save_settings(self.settings)
 
     def show_history_dialog(self) -> None:
@@ -1844,6 +2005,10 @@ class MainWindow(QMainWindow):
 
     def _reload_after_restore(self) -> None:
         """恢复后重新加载全部数据。"""
+        # 任务G：云端恢复带回的 covers/ 先做迁移/孤儿整理，并清空位图缓存
+        self.storage.housekeep_covers_once(force=True)
+        from app.ui.widgets import cover_cache_clear
+        cover_cache_clear()
         self.settings = self.storage.load_settings()
         self._load_imported_fonts()
         self.achievements = AchievementManager(self.storage)
@@ -2018,5 +2183,18 @@ class MainWindow(QMainWindow):
         self.flush()
         self.words_timer.stop()
         self._flush_words()
+        # 独立窗口 / 面板里可能还有防抖未触发的改动（时间轴、大纲、设定、
+        # 地图、角色关系），逐个 flush，避免强关窗口时丢最后一批编辑。
+        for dialog in list(self._timeline_dialogs):
+            dialog.flush_pending()
+        for dialog in list(self._outline_dialogs):
+            dialog.flush_pending()
+        for dialog in list(self._map_dialogs.values()):
+            dialog.flush_pending()
+        for window in list(self._note_windows.values()):
+            window.flush_pending()
+        panel = self.shelf.characters_view()
+        if panel is not None:
+            panel.flush_pending()
         self.storage.save_settings(self.settings)
         super().closeEvent(event)

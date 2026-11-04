@@ -85,7 +85,10 @@ class Settings:
 
     # 字数
     exclude_punct: bool = False         # 字数统计不计标点
-    speed_unit: str = "per_min"         # 码字速度单位：per_min 字/分 / per_hour 字/时
+    speed_unit: str = "per_min"         # （v3 起保留兼容）旧版 字/分 / 字/时
+    # v3：时速面板速度单位（只换显示，不影响内部统计）：char 字/分 / hour 字/时
+    speed_unit_scale: str = "char"
+    speed_tracking: bool = True         # 本次码字统计开关（圆钮右键暂停/继续）
 
     # 操作
     fast_scroll: bool = True
@@ -109,6 +112,12 @@ class Settings:
 
     # 书架
     shelf_view: str = "grid"            # grid / list
+    character_view: str = "list"        # 角色页：list 角色列表 / board 关系图
+    ui_style: str = "default"           # 外观风格：default/paper/glass/order（与深浅正交）
+    # 玻璃质感三档（ui_style=glass 时生效）：block 立体玻璃块（默认）/ liquid 液态玻璃 / frosted 磨砂雾面
+    glass_mode: str = "block"
+    glass_blur: bool = True             # 玻璃风：背后内容高斯模糊（关闭后仅半透明本体，低端机可用）
+    boot_animation: bool = True         # 启动小动画（黑白线稿莲花绽放，可点击/按任意键跳过）
     nickname: str = "写作者"
     avatar_path: str = ""
     showcase_medal: str = ""            # 首页左下角展示的成就勋章（成就 id，空 = 不展示；成就页右键更换）
@@ -157,6 +166,15 @@ class Settings:
             result.writing_theme = "auto"
         if result.shelf_view not in {"grid", "list"}:
             result.shelf_view = "grid"
+        if result.character_view not in {"list", "board"}:
+            result.character_view = "list"
+        if result.ui_style not in {"default", "paper", "glass", "order"}:
+            result.ui_style = "default"
+        if result.glass_mode not in {"block", "liquid", "frosted"}:
+            result.glass_mode = "block"
+        # 旧配置可能存 kilo/wan（早期三档口径），统一平滑回退到「字/分」
+        if result.speed_unit_scale not in {"char", "hour"}:
+            result.speed_unit_scale = "char"
         if result.indent not in {"two", "none"}:
             result.indent = "two"
         if result.blank_line not in {"blank", "none"}:
@@ -264,6 +282,12 @@ class TimelineEvent:
     time: str = ""
     event: str = ""
     desc: str = ""
+    # 锁定后不可拖动（仍可选中 / 编辑内容 / 换色）；color 为语义色键，"" 表示默认主题色
+    locked: bool = False
+    color: str = ""
+    # v3：上/下引线长度（像素），-1 或缺键 = 默认长度；仅由 Ctrl+左键拖动调整
+    lead_top: float = -1.0
+    lead_bot: float = -1.0
 
     def to_dict(self) -> dict:
         return {
@@ -272,18 +296,35 @@ class TimelineEvent:
             "time": self.time,
             "event": self.event,
             "desc": self.desc,
+            "locked": self.locked,
+            "color": self.color,
+            "lead_top": self.lead_top,
+            "lead_bot": self.lead_bot,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "TimelineEvent":
         # 兼容旧版书籍内置时间轴的字段名（title / below）
         title = str(data.get("event") or data.get("title") or "")
+
+        def _lead(key: str) -> float:
+            try:
+                v = float(data.get(key, -1.0))
+            except (TypeError, ValueError):
+                return -1.0
+            return v if v > 0 else -1.0   # 缺键 / 非法 / 非正一律回退默认
+
         return cls(
             id=str(data.get("id") or new_id()),
             x=float(data.get("x") or 0),
             time=str(data.get("time") or ""),
             event=title,
             desc=str(data.get("desc") or ""),
+            # 旧数据缺键时自动回退：未锁定 + 默认色（禁止用 bool("false") 这种误判）
+            locked=data.get("locked") is True,
+            color=str(data.get("color") or ""),
+            lead_top=_lead("lead_top"),
+            lead_bot=_lead("lead_bot"),
         )
 
 
@@ -526,20 +567,6 @@ class Book:
     def volume_of(self, chapter_id: str) -> Volume | None:
         return self.find_chapter(chapter_id)[0]
 
-    def previous_chapter(self, chapter_id: str) -> Chapter | None:
-        chapters = self.all_chapters()
-        for i, ch in enumerate(chapters):
-            if ch.id == chapter_id and i > 0:
-                return chapters[i - 1]
-        return None
-
-    def next_chapter(self, chapter_id: str) -> Chapter | None:
-        chapters = self.all_chapters()
-        for i, ch in enumerate(chapters):
-            if ch.id == chapter_id and i + 1 < len(chapters):
-                return chapters[i + 1]
-        return None
-
     # ---------------- 序列化 ----------------
 
     def to_dict(self) -> dict:
@@ -677,3 +704,203 @@ def next_chapter_title(volume: Volume) -> str:
         if title not in used:
             return title
         index += 1
+
+
+# ======================================================================
+# 角色卡与角色关系（保存在 library.json 的 characters / character_relations 中）
+# ======================================================================
+CHARACTER_ROLES = ["主角", "重要配角", "配角", "反派", "路人"]
+RELATION_NAMES = ["师徒", "宿敌", "恋人", "血亲", "主仆", "朋友", "同门"]
+
+# 角色卡方框属性（图二布局）：三列九项，标签可右键改名 / 删除 / 新增
+DEFAULT_CARD_FIELDS = ["灵根", "仙脉", "性别", "斗魂", "主修", "功法", "战技", "武器", "法宝"]
+GENDER_FIELD = "性别"
+
+
+@dataclass
+class Character:
+    """一张角色卡。x / y 为关系图上的卡片坐标（随拖拽持久化）。"""
+
+    id: str
+    name: str = "未命名角色"
+    alias: str = ""
+    role: str = "配角"
+    gender: str = ""
+    age: str = ""
+    appearance: str = ""
+    personality: str = ""
+    backstory: str = ""
+    goals: str = ""
+    speech: str = ""
+    tags: list[str] = field(default_factory=list)
+    first_chapter: str = ""
+    note: str = ""
+    # 人物短章：角色卡小书本右键编辑的自由文本（旧数据缺键自动补空串）
+    memo: str = ""
+    # 从书籍正文提取时预填：出场章节列表 / 原文摘录（带章节出处），旧数据缺省不报错
+    chapters: list[str] = field(default_factory=list)
+    description: str = ""
+    # 角色卡方框属性（灵根 / 仙脉 / 性别 …），每项 {"label", "value"}，可改名/增删
+    card_fields: list[dict] = field(default_factory=list)
+    x: float = 0.0
+    y: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "alias": self.alias,
+            "role": self.role,
+            "gender": self.gender,
+            "age": self.age,
+            "appearance": self.appearance,
+            "personality": self.personality,
+            "backstory": self.backstory,
+            "goals": self.goals,
+            "speech": self.speech,
+            "tags": [str(t) for t in self.tags],
+            "first_chapter": self.first_chapter,
+            "note": self.note,
+            "memo": self.memo,
+            "chapters": [str(c) for c in self.chapters],
+            "description": self.description,
+            "card_fields": [
+                {"label": str(f.get("label") or ""), "value": str(f.get("value") or "")}
+                for f in self.card_fields
+            ],
+            "x": self.x,
+            "y": self.y,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Character":
+        tags_raw = data.get("tags")
+        if isinstance(tags_raw, str):
+            tags = [t.strip() for t in tags_raw.replace("，", ",").split(",") if t.strip()]
+        elif isinstance(tags_raw, list):
+            tags = [str(t).strip() for t in tags_raw if str(t).strip()]
+        else:
+            tags = []
+        chapters_raw = data.get("chapters")
+        if isinstance(chapters_raw, list):
+            chapters = [str(c).strip() for c in chapters_raw if str(c).strip()]
+        else:
+            chapters = []
+        # 方框属性：旧数据缺键 -> 用图二默认九项，并把已有的「性别」预填进去
+        card_fields = cls._parse_card_fields(
+            data.get("card_fields"), str(data.get("gender") or "")
+        )
+        return cls(
+            id=str(data.get("id") or new_id()),
+            name=str(data.get("name") or "未命名角色"),
+            alias=str(data.get("alias") or ""),
+            role=str(data.get("role") or "配角"),
+            gender=str(data.get("gender") or ""),
+            age=str(data.get("age") or ""),
+            appearance=str(data.get("appearance") or ""),
+            personality=str(data.get("personality") or ""),
+            backstory=str(data.get("backstory") or ""),
+            goals=str(data.get("goals") or ""),
+            speech=str(data.get("speech") or ""),
+            tags=tags,
+            first_chapter=str(data.get("first_chapter") or ""),
+            note=str(data.get("note") or ""),
+            memo=str(data.get("memo") or ""),   # 旧角色缺键 -> 空串，不报错
+            chapters=chapters,
+            description=str(data.get("description") or ""),
+            card_fields=card_fields,
+            x=float(data.get("x") or 0),
+            y=float(data.get("y") or 0),
+            created_at=float(data.get("created_at") or time.time()),
+            updated_at=float(data.get("updated_at") or time.time()),
+        )
+
+    @staticmethod
+    def _parse_card_fields(raw, gender: str) -> list[dict]:
+        """容错读取方框属性；旧数据 / 异常数据一律回退默认九项，不报错。"""
+        fields: list[dict] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    label = str(item.get("label") or "").strip()
+                    if label:
+                        fields.append({"label": label, "value": str(item.get("value") or "").strip()})
+        if not fields:
+            fields = [{"label": name, "value": ""} for name in DEFAULT_CARD_FIELDS]
+        # 性别项与顶层 gender 同步（旧数据只有 gender）
+        for item in fields:
+            if item["label"] == GENDER_FIELD and not item["value"] and gender:
+                item["value"] = gender
+        return fields
+
+    def touch(self) -> None:
+        self.updated_at = time.time()
+
+
+@dataclass
+class CharacterRelation:
+    """一条角色关系（v3：同两个角色可各持一条反向独立边）。
+
+    intensity 取整数区间 [-3, 3]：正数偏亲密、负数偏敌对、0 中性。
+    方向语义：
+    - directed=False：无向（不画箭头）；
+    - directed=True、bidirectional=False：独立有向边，from_id → to_id，
+      同一对角色允许再存在一条 to_id → from_id 的独立边（name/intensity/note/color 各自独立）；
+    - directed=True、bidirectional=True：旧版「一根线两端箭头」，仅旧数据存在，
+      storage 一次性迁移成两条同名独立有向边；split_from 记录迁移批次保证幂等。
+    """
+
+    id: str
+    from_id: str
+    to_id: str
+    name: str = "关系"
+    directed: bool = False
+    bidirectional: bool = False
+    intensity: int = 0
+    note: str = ""
+    # 关系线颜色（#RRGGBB；空 = 跟随强度自动配色）。导出/导入原样保留，
+    # 界面暂无取色器时不影响既有观感。
+    color: str = ""
+    created_at: float = field(default_factory=time.time)
+    split_from: str = ""   # 旧 bidirectional 拆分迁移标记（"bidir:<原id>"），重复迁移不产生副本
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "from_id": self.from_id,
+            "to_id": self.to_id,
+            "name": self.name,
+            "directed": self.directed,
+            "bidirectional": self.bidirectional,
+            "intensity": int(self.intensity),
+            "note": self.note,
+            "color": self.color,
+            "created_at": self.created_at,
+            "split_from": self.split_from,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CharacterRelation":
+        try:
+            intensity = int(float(data.get("intensity") or 0))
+        except (TypeError, ValueError):
+            intensity = 0
+        intensity = max(-3, min(3, intensity))
+        return cls(
+            id=str(data.get("id") or new_id()),
+            from_id=str(data.get("from_id") or data.get("from") or ""),
+            to_id=str(data.get("to_id") or data.get("to") or ""),
+            name=str(data.get("name") or "关系"),
+            directed=bool(data.get("directed")),
+            # 旧数据无此键 -> 单向语义不变（只有 directed 为真时该标记才有意义）
+            bidirectional=data.get("bidirectional") is True and bool(data.get("directed")),
+            intensity=intensity,
+            note=str(data.get("note") or ""),
+            color=_clean_color(data.get("color")),
+            created_at=float(data.get("created_at") or time.time()),
+            split_from=str(data.get("split_from") or ""),
+        )

@@ -17,6 +17,7 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QImage,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -25,7 +26,7 @@ from PySide6.QtGui import (
     QRadialGradient,
 )
 
-_CACHE: dict[tuple[str, int], QPixmap] = {}
+_CACHE: dict[tuple[str, int, bool], QPixmap] = {}
 
 
 def _qc(color: str, alpha: int) -> QColor:
@@ -151,8 +152,6 @@ def _ink_blob(p: QPainter, cx: float, cy: float, r: float, color: str, alpha: in
 def _brush_pen(p: QPainter, x: float, y: float, length: float, angle: float,
                shaft: str, tip: str) -> None:
     """毛笔：笔杆 + 笔锋（angle 为笔锋指向的角度，单位度，0 = 向下）。"""
-    import math
-
     p.save()
     p.translate(x, y)
     p.rotate(angle)
@@ -462,7 +461,7 @@ def _m_sun_mountain(p: QPainter, r: QRectF, spec: dict) -> None:
                   r.width() * 0.13, r.width() * 0.13)
     p.restore()
     # 两重山
-    for i, (frac, hfrac, alpha) in enumerate(((0.86, 0.26, 90), (0.62, 0.20, 150))):
+    for i, (frac, _hfrac, alpha) in enumerate(((0.86, 0.26, 90), (0.62, 0.20, 150))):
         path = QPainterPath()
         left = r.center().x() - r.width() * frac / 2
         right = r.center().x() + r.width() * frac / 2
@@ -553,13 +552,28 @@ MOTIFS = {
 # ---------------------------------------------------------------------------
 # 总绘制入口
 # ---------------------------------------------------------------------------
-def medal_pixmap(key: str, size: int = 96) -> QPixmap:
-    """返回勋章（透明底，仅主体），按 (key, size) 缓存。
+def _grayscale_with_alpha(pix: QPixmap) -> QPixmap:
+    """灰度化但保留透明通道（Format_Grayscale8 会丢 alpha，透明区变黑底）。"""
+    src = pix.toImage().convertToFormat(QImage.Format_ARGB32)
+    gray = src.convertToFormat(QImage.Format_Grayscale8).convertToFormat(
+        QImage.Format_ARGB32
+    )
+    mask = src.convertToFormat(QImage.Format_Alpha8)
+    painter = QPainter(gray)
+    painter.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+    painter.drawImage(0, 0, mask)
+    painter.end()
+    return QPixmap.fromImage(gray)
+
+
+def medal_pixmap(key: str, size: int = 96, gray: bool = False) -> QPixmap:
+    """返回勋章（透明底，仅主体），按 (key, size, gray) 缓存。
 
     优先加载 assets/medals/<key>.png 图片资源（AI 生成的水墨勋章图，已去背
-    景）；资源缺失时回退到 QPainter 程序绘制。
+    景）；资源缺失时回退到 QPainter 程序绘制。gray=True 返回灰度版本
+    （未解锁成就用），灰度结果同样缓存，避免每次重建卡片都重算。
     """
-    cache_key = (str(key), int(size))
+    cache_key = (str(key), int(size), bool(gray))
     if cache_key in _CACHE:
         return _CACHE[cache_key]
     pix = QPixmap(int(size), int(size))
@@ -575,81 +589,78 @@ def medal_pixmap(key: str, size: int = 96) -> QPixmap:
             pix = source.scaled(
                 int(size), int(size), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
-            _CACHE[cache_key] = pix
-            return pix
 
     # 2) 程序绘制回退
-    spec = SPECS.get(str(key))
-    if spec is None:
-        _CACHE[cache_key] = pix
-        return pix
+    elif (spec := SPECS.get(str(key))) is not None:
+        size = int(size)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        margin = size * 0.045
+        rect = QRectF(margin, margin, size - 2 * margin, size - 2 * margin)
+        shape = str(spec.get("shape") or "circle")
 
-    size = int(size)
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    margin = size * 0.045
-    rect = QRectF(margin, margin, size - 2 * margin, size - 2 * margin)
-    shape = str(spec.get("shape") or "circle")
+        # 外环（金属渐变）
+        rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        rim.setColorAt(0.0, QColor(spec["rim"][0]))
+        rim.setColorAt(1.0, QColor(spec["rim"][1]))
+        p.setPen(QPen(QColor(0, 0, 0, 60), size * 0.008))
+        p.setBrush(QBrush(rim))
+        p.drawPath(_shape_path(shape, rect))
 
-    # 外环（金属渐变）
-    rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
-    rim.setColorAt(0.0, QColor(spec["rim"][0]))
-    rim.setColorAt(1.0, QColor(spec["rim"][1]))
-    p.setPen(QPen(QColor(0, 0, 0, 60), size * 0.008))
-    p.setBrush(QBrush(rim))
-    p.drawPath(_shape_path(shape, rect))
+        # 内盘面
+        inset = rect.width() * 0.075
+        face_rect = rect.adjusted(inset, inset, -inset, -inset)
+        face = QLinearGradient(face_rect.topLeft(), face_rect.bottomLeft())
+        face.setColorAt(0.0, QColor(spec["face"][0]))
+        face.setColorAt(1.0, QColor(spec["face"][1]))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(face))
+        p.drawPath(_shape_path(shape, face_rect))
 
-    # 内盘面
-    inset = rect.width() * 0.075
-    face_rect = rect.adjusted(inset, inset, -inset, -inset)
-    face = QLinearGradient(face_rect.topLeft(), face_rect.bottomLeft())
-    face.setColorAt(0.0, QColor(spec["face"][0]))
-    face.setColorAt(1.0, QColor(spec["face"][1]))
-    p.setPen(Qt.NoPen)
-    p.setBrush(QBrush(face))
-    p.drawPath(_shape_path(shape, face_rect))
+        # 水墨底晕（左右两团，营造宣纸洇墨感）
+        ink = str(spec.get("ink") or "#2B2A26")
+        _ink_blob(p, face_rect.left() + face_rect.width() * 0.22,
+                  face_rect.top() + face_rect.height() * 0.30, face_rect.width() * 0.26, ink, 16)
+        _ink_blob(p, face_rect.right() - face_rect.width() * 0.24,
+                  face_rect.bottom() - face_rect.height() * 0.34, face_rect.width() * 0.24, ink, 12)
 
-    # 水墨底晕（左右两团，营造宣纸洇墨感）
-    ink = str(spec.get("ink") or "#2B2A26")
-    _ink_blob(p, face_rect.left() + face_rect.width() * 0.22,
-              face_rect.top() + face_rect.height() * 0.30, face_rect.width() * 0.26, ink, 16)
-    _ink_blob(p, face_rect.right() - face_rect.width() * 0.24,
-              face_rect.bottom() - face_rect.height() * 0.34, face_rect.width() * 0.24, ink, 12)
+        # 纹样（裁剪进盘面）
+        painter_motif = MOTIFS.get(str(spec.get("motif") or ""))
+        if painter_motif is not None:
+            p.save()
+            p.setClipPath(_shape_path(shape, face_rect))
+            painter_motif(p, face_rect, spec)
+            p.restore()
 
-    # 纹样（裁剪进盘面）
-    painter_motif = MOTIFS.get(str(spec.get("motif") or ""))
-    if painter_motif is not None:
-        p.save()
-        p.setClipPath(_shape_path(shape, face_rect))
-        painter_motif(p, face_rect, spec)
-        p.restore()
-
-    # 内缘细线
-    p.setPen(QPen(QColor(0, 0, 0, 42), max(1.0, size * 0.007)))
-    p.setBrush(Qt.NoBrush)
-    p.drawPath(_shape_path(shape, face_rect))
-
-    # 铭牌（底部缎带形）+ 成就名
-    from app.services.achievements import ACHIEVEMENTS
-
-    name = str((ACHIEVEMENTS.get(str(key)) or {}).get("name") or "")
-    if name:
-        pw, ph = size * 0.70, size * 0.185
-        plaque = QRectF((size - pw) / 2, size * 0.735, pw, ph)
-        p.setPen(QPen(QColor(0, 0, 0, 90), size * 0.006))
-        p.setBrush(QColor(spec["plaque"]))
-        p.drawRoundedRect(plaque, ph * 0.32, ph * 0.32)
-        p.setPen(QPen(QColor(spec["text"]), size * 0.004))
+        # 内缘细线
+        p.setPen(QPen(QColor(0, 0, 0, 42), max(1.0, size * 0.007)))
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(plaque.adjusted(ph * 0.10, ph * 0.12, -ph * 0.10, -ph * 0.12),
-                          ph * 0.24, ph * 0.24)
-        font = QFont()
-        font.setPixelSize(max(9, int(ph * 0.52)))
-        font.setBold(True)
-        p.setFont(font)
-        p.setPen(QPen(QColor(spec["text"])))
-        p.drawText(plaque, Qt.AlignCenter, name)
-    p.end()
+        p.drawPath(_shape_path(shape, face_rect))
+
+        # 铭牌（底部缎带形）+ 成就名
+        from app.services.achievements import ACHIEVEMENTS
+
+        name = str((ACHIEVEMENTS.get(str(key)) or {}).get("name") or "")
+        if name:
+            pw, ph = size * 0.70, size * 0.185
+            plaque = QRectF((size - pw) / 2, size * 0.735, pw, ph)
+            p.setPen(QPen(QColor(0, 0, 0, 90), size * 0.006))
+            p.setBrush(QColor(spec["plaque"]))
+            p.drawRoundedRect(plaque, ph * 0.32, ph * 0.32)
+            p.setPen(QPen(QColor(spec["text"]), size * 0.004))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(plaque.adjusted(ph * 0.10, ph * 0.12, -ph * 0.10, -ph * 0.12),
+                              ph * 0.24, ph * 0.24)
+            font = QFont()
+            font.setPixelSize(max(9, int(ph * 0.52)))
+            font.setBold(True)
+            p.setFont(font)
+            p.setPen(QPen(QColor(spec["text"])))
+            p.drawText(plaque, Qt.AlignCenter, name)
+        p.end()
+
+    if gray and not pix.isNull():
+        pix = _grayscale_with_alpha(pix)
 
     _CACHE[cache_key] = pix
     return pix

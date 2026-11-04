@@ -12,8 +12,8 @@ QWidget {
     font-family: "$font_family", "PingFang SC", "Segoe UI", sans-serif;
     font-size: ${font_size}px;
 }
-QMainWindow, QDialog { background: $window; }
-#Root { background: $window; }
+QMainWindow, QDialog { background: $window_bg; }
+#Root { background: $window_bg; }
 
 /* ---------------- 顶部工具栏（融入浅灰背景，三段式布局） ---------------- */
 #TopBar {
@@ -23,7 +23,6 @@ QMainWindow, QDialog { background: $window; }
 }
 #Brand { color: $text; font-size: 16px; font-weight: 700; }
 #BrandSub { color: $subtext; font-size: 10px; letter-spacing: 2px; }
-#ToolSep { background: transparent; border: none; max-width: 1px; min-width: 1px; }
 QToolButton {
     background: transparent;
     border: none;
@@ -32,7 +31,7 @@ QToolButton {
 }
 QToolButton:hover { background: $hover; }
 QToolButton:pressed { background: $pressed; }
-QToolButton:checked { background: $hover; color: $text; }
+QToolButton:checked { background: $selected_bg; color: $accent; font-weight: 600; }
 QToolButton:disabled { background: transparent; }
 QToolButton#FloatButton {
     background: $panel;
@@ -48,20 +47,26 @@ QToolButton#FloatButton:hover { background: $hover_accent; }
     border: 1px solid $glass_border;
 }
 #BookTitle { font-size: 15px; font-weight: 600; color: $text; }
-#BookMeta, #SidebarFoot, #DrawerHint, #CardMeta, #CardSummary, #EditorStatus, #ShelfSubtitle {
+#BookMeta, #SidebarFoot, #DrawerHint, #CardSummary, #EditorStatus, #ShelfSubtitle {
     color: $subtext;
     font-size: 11px;
 }
 #TabButton {
     background: transparent;
     border: none;
+    border-left: 2px solid transparent;   /* 预留选中竖条位，避免状态切换抖动 */
     border-radius: ${radius}px;
     padding: 8px 0;
     color: $subtext;
     font-size: 12px;
 }
 #TabButton:hover { background: $hover; color: $text; }
-#TabButton:checked { background: $hover; color: $text; font-weight: 600; }
+#TabButton:checked {
+    background: $selected_bg;
+    border-left: 2px solid $selected_border;
+    color: $accent;
+    font-weight: 600;
+}
 #HLine { background: transparent; border: none; max-height: 1px; min-height: 1px; }
 
 QTreeWidget, QTreeView { background: transparent; border: none; color: $text;
@@ -69,7 +74,11 @@ QTreeWidget, QTreeView { background: transparent; border: none; color: $text;
   show-decoration-selected: 0; outline: 0; }
 QTreeView::item { padding: 8px 6px; border-radius: ${radius_sm}px; }
 QTreeView::item:hover, QTreeView::item:focus { background: $hover; outline: 0; }
-QTreeView::item:selected { background: $hover; color: $text; font-weight: 600; }
+QTreeView::item:selected {
+    background: $selected_bg;
+    color: $accent;
+    font-weight: 600;
+}
 QTreeView::branch { background: transparent; }
 /* 选中 / 悬停行的缩进区（branch）必须显式置透明，
    否则 Fusion 会用调色板 Highlight（主题紫）填充出一根生硬竖条 */
@@ -78,7 +87,11 @@ QTreeView::branch:selected { background: transparent; }
 QListWidget { background: transparent; border: none; outline: 0; }
 QListWidget::item { padding: 9px; border-radius: ${radius_sm}px; color: $text; }
 QListWidget::item:hover { background: $hover; }
-QListWidget::item:selected { background: $hover; color: $text; }
+QListWidget::item:selected {
+    background: $selected_bg;
+    color: $accent;
+    font-weight: 600;
+}
 
 /* ---------------- 正文编辑区：悬浮 A4 白纸 + 柔和投影 ---------------- */
 /* 章节标题融合在纸张内部：居中、加粗、标题下 30px 间距由布局控制 */
@@ -131,11 +144,6 @@ QTextEdit#Preview {
     color: $text;
     padding: 10px;
     font-size: 12px;
-}
-#StatusBar {
-    background: $statusbar_bg;
-    border: none;
-    border-radius: ${radius_sm}px;
 }
 #EditorStatus { color: $statusbar_text; padding: 0 8px; }
 #SaveHint { color: $statusbar_text; font-size: 11px; }
@@ -201,11 +209,7 @@ QTextEdit#Preview {
     padding: 3px 7px;
 }
 #SegButton:hover { color: $text; }
-#SegButton:checked {
-    background: $panel;
-    color: $text;
-    font-weight: 700;
-}
+/* 选中态统一在下方五态段定义（$selected_bg + $accent），此处不再重复 */
 
 /* ---------------- 统一提示弹窗（圆角卡片 + 阴影 + 中文按钮） ---------------- */
 QFrame#MessageBox {
@@ -271,38 +275,46 @@ QSpinBox::up-button, QSpinBox::down-button {
 }
 QCheckBox { color: $text; spacing: 6px; }
 
-/* ---------------- 按钮：白/浅灰底无边框，悬停柔和加深 ---------------- */
+/* ---------------- 按钮五态：rest / hover / focus / pressed / disabled ---------------- */
 QPushButton {
     background: $panel;
     color: $text;
-    border: none;
+    border: 1px solid transparent;   /* 预留 1px，状态切换不抖动 */
     border-radius: ${radius}px;
     padding: ${btn_pad_y}px ${btn_pad_x}px;
 }
-QPushButton:hover { background: $hover; }
+QPushButton:hover { background: $hover; border: 1px solid $hover_border; }
 QPushButton:pressed { background: $pressed; }
-QPushButton:disabled { color: $subtext; background: $panel_alt; }
-QPushButton#Primary {
+QPushButton:focus { border: 1px solid $selected_border; }
+QPushButton:disabled { color: $disabled_text; background: $disabled_bg; border-color: transparent; }
+QPushButton#Primary, QPushButton#GlassPrimary {
     background: $accent;
     color: $on_accent;
     font-weight: 600;
 }
 QPushButton#Primary:hover { background: $accent_hover; }
 QPushButton#Primary:pressed { background: $accent_hover; }
-QPushButton#Primary:disabled { background: $accent_soft; color: $subtext; }
+QPushButton#Primary:disabled { background: $accent_soft; color: $disabled_text; }
+/* GlassPrimary 的悬停玻璃层与焦点环由代码自绘，QSS 不再叠加描边避免双重焦点 */
+QPushButton#GlassPrimary:hover { background: $accent_hover; }
+QPushButton#GlassPrimary:pressed { background: $accent_hover; }
+QPushButton#GlassPrimary:disabled { background: $accent_soft; color: $disabled_text; }
+QPushButton#GlassPrimary:focus { border: none; }
 QPushButton#GhostButton {
     background: $panel_alt;
     padding: 8px 14px;
     font-size: 12px;
     color: $subtext;
 }
-QPushButton#GhostButton:hover { color: $text; background: $hover; }
+QPushButton#GhostButton:hover { color: $text; background: $hover; border: 1px solid $hover_border; }
+QPushButton#GhostButton:disabled { color: $disabled_text; }
 QPushButton#DangerButton { color: $danger; background: $panel_alt; }
 QPushButton#DangerButton:hover { background: $danger; color: #FFFFFF; }
 QPushButton#TabButton { padding: 8px 0; }
 QPushButton#NavButton {
     background: transparent;
     border: none;
+    border-left: 2px solid transparent;   /* 预留选中竖条位 */
     border-radius: ${radius}px;
     padding: 11px 14px;
     text-align: left;
@@ -310,27 +322,44 @@ QPushButton#NavButton {
     font-size: 13px;
 }
 QPushButton#NavButton:hover { background: $hover; }
-/* 侧边栏选中项：浅灰色圆角背景高亮（不用竖线） */
-QPushButton#NavButton:checked { background: $hover; color: $text; font-weight: 600; }
+/* 侧边栏选中项：强调色淡底 + 左侧 2px 强调竖条，与 hover 中性灰明显区分 */
+QPushButton#NavButton:checked {
+    background: $selected_bg;
+    border-left: 2px solid $selected_border;
+    color: $accent;
+    font-weight: 600;
+}
+QPushButton#NavButton:disabled { color: $disabled_text; background: transparent; }
 QPushButton#ViewChip {
     background: $panel;
-    border: none;
+    border: 1px solid transparent;
     border-radius: ${radius}px;
     padding: 7px 14px;
     color: $subtext;
     font-size: 12px;
 }
-QPushButton#ViewChip:hover { background: $hover; color: $text; }
-QPushButton#ViewChip:checked { background: $panel_alt; color: $text; font-weight: 600; }
+QPushButton#ViewChip:hover { background: $hover; color: $text; border: 1px solid $hover_border; }
+QPushButton#ViewChip:checked {
+    background: $selected_bg;
+    border: 1px solid $selected_border;
+    color: $accent;
+    font-weight: 600;
+}
 QPushButton#NameChip {
     background: $panel_alt;
-    border: none;
+    border: 1px solid transparent;
     border-radius: ${radius}px;
     color: $text;
     font-size: 14px;
     padding: 12px 6px;
 }
-QPushButton#NameChip:hover { background: $hover_accent; color: $accent; }
+QPushButton#NameChip:hover { background: $hover; border: 1px solid $hover_border; color: $text; }
+QPushButton#NameChip:checked {
+    background: $selected_bg;
+    border: 1px solid $selected_border;
+    color: $accent;
+    font-weight: 600;
+}
 
 /* ---------------- 设置抽屉 ---------------- */
 #Drawer { background: $sidebar_glass; border-left: 1px solid $glass_border; }
@@ -346,7 +375,12 @@ QPushButton#NameChip:hover { background: $hover_accent; color: $accent; }
     color: $subtext;
     font-size: 12px;
 }
-#SegButton:checked { background: $panel; color: $text; font-weight: 600; }
+#SegButton:hover { color: $text; }
+#SegButton:checked {
+    background: $panel;
+    color: $accent;
+    font-weight: 700;
+}
 #DrawerClose {
     background: transparent;
     border: none;
@@ -378,12 +412,6 @@ QPushButton#NameChip:hover { background: $hover_accent; color: $accent; }
 #ShowcaseTag { background: $accent_soft; color: $accent; border: none; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 600; }
 #UserName { font-size: 13px; font-weight: 600; color: $text; }
 #UserHint { font-size: 10px; color: $subtext; }
-#TrashRow { background: $panel; border: none; border-radius: ${radius}px; }
-#CoverDrop {
-    background: $panel_alt;
-    border: 1px dashed $border_strong;
-    border-radius: ${radius}px;
-}
 #StatCard { background: $panel; border: none; border-radius: ${radius_lg}px; }
 #StatValue { font-size: 22px; font-weight: 700; color: $text; }
 #StatLabel { font-size: 11px; color: $subtext; }
@@ -403,15 +431,6 @@ QPushButton#NameChip:hover { background: $hover_accent; color: $accent; }
 
 /* ---------------- 思维导图 ---------------- */
 #OutlineBar { background: $panel; border: none; }
-#OutlineNodeButton {
-    background: $panel_alt;
-    border: none;
-    border-radius: ${radius}px;
-    padding: 6px 12px;
-    color: $text;
-    font-size: 12px;
-}
-#OutlineNodeButton:hover { background: $hover_accent; color: $accent; }
 
 /* ---------------- 弹窗 / 菜单 ---------------- */
 QDialog { background: $window; }
@@ -492,3 +511,135 @@ QFrame#CalCellToday {
 }
 QLabel#CalDay { color: $subtext; font-size: 10px; }
 QLabel#CalCount { color: $accent; font-size: 12px; font-weight: 600; }
+
+/* ---------------- 角色卡 · 关系列板/画布 ---------------- */
+#RelationBar { background: $panel; border: none; }
+#RelationHint { color: $subtext; font-size: 11px; }
+
+/* 角色表格：1px 低对比边框 + 无内部竖线，表头弱化；五态行反馈 */
+#CharTable {
+    background: $panel;
+    border: 1px solid $border;
+    border-radius: ${radius_lg}px;
+    gridline-color: transparent;
+    selection-background-color: $selected_bg_strong;
+    selection-color: $text;
+    alternate-background-color: $panel;
+}
+#CharTable::item { padding: 6px 8px; border: none; }
+#CharTable::item:hover { background: $hover; }
+#CharTable::item:selected {
+    background: $selected_bg_strong;
+    color: $text;
+    border-left: 2px solid $selected_border;
+}
+#CharTable QHeaderView::section {
+    background: $table_header_bg;
+    color: $subtext;
+    border: none;
+    border-bottom: 1px solid $table_header_border;
+    padding: 8px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+#CharTable QTableCornerButton::section { background: $table_header_bg; border: none; }
+
+/* 角色详情卡片 */
+#CharDetailTitle { color: $text; font-size: 16px; font-weight: 700; font-family: $font_title; }
+#CharDetailSub { color: $subtext; font-size: 12px; }
+#CharDetailKey { color: $subtext; font-size: 11px; }
+#CharDetailValue { color: $text; font-size: 13px; }
+#CharDetailSection {
+    color: $subtext;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    margin-top: ${section_gap}px;
+}
+#CharRelRow { background: $panel_alt; border: none; border-radius: ${radius_sm}px; }
+#CharRelName { color: $text; font-size: 12px; font-weight: 600; }
+#CharRelMeta { color: $subtext; font-size: 11px; }
+#CharEmpty { color: $subtext; font-size: 13px; }
+
+/* ============================================================
+   视觉打磨 v1.2：焦点框 / 行 hover / 进度条 / 复选框 / 按压反馈
+   ============================================================ */
+
+/* 键盘 / 鼠标焦点框：按钮预留 1px 透明边，聚焦时显形，不引起布局位移 */
+QPushButton, QToolButton { border: 1px solid transparent; }
+QPushButton:focus, QToolButton:focus { border: 1px solid $focus_ring; }
+QListWidget:focus, QTableWidget:focus, QTextEdit:focus, QPlainTextEdit:focus,
+QTreeView:focus { outline: 0; }
+
+/* 分段控件：hover 与按压反馈（checked 选中态在上文统一为强调色） */
+#SegButton:hover { color: $text; }
+#SegButton:pressed { background: $pressed; }
+#SegButton:checked:hover { background: $panel; }
+
+/* 次按钮 / 危险按钮按压态 */
+QPushButton#GhostButton:pressed { background: $pressed; }
+QPushButton#DangerButton:pressed { background: $danger; color: #FFFFFF; }
+
+/* 角色表格行：hover 中性灰 / selected 强调淡底+左竖条（与上方规则一致，防止旧覆盖） */
+QTableWidget#CharTable::item:hover { background: $hover; }
+QTableWidget#CharTable::item:selected {
+    background: $selected_bg_strong;
+    color: $text;
+    border-left: 2px solid $selected_border;
+}
+
+/* 候选 / 书籍选择列表：选中用强调色淡底，与 hover 中性灰区分 */
+QListWidget::item:selected { background: $selected_bg; color: $accent; font-weight: 600; }
+
+/* 进度条（后台任务等） */
+QProgressBar {
+    background: $panel_alt;
+    border: 1px solid $border;
+    border-radius: ${radius_sm}px;
+    height: 10px;
+    text-align: center;
+    color: $subtext;
+    font-size: 11px;
+}
+QProgressBar::chunk {
+    background: $accent;
+    border-radius: ${radius_sm}px;
+}
+
+/* 复选框：简约自定义指示块 */
+QCheckBox::indicator {
+    width: 15px;
+    height: 15px;
+    border-radius: 4px;
+    border: 1px solid $border_strong;
+    background: $panel;
+}
+QCheckBox::indicator:hover { border-color: $accent; }
+QCheckBox::indicator:checked {
+    background: $accent;
+    border-color: $accent;
+}
+QCheckBox:disabled { color: $subtext; }
+
+/* 禁用态输入框 */
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled,
+QFontComboBox:disabled {
+    background: $panel_alt;
+    color: $subtext;
+}
+
+/* 右键菜单按压反馈 */
+QMenu::item:pressed { background: $pressed; }
+
+QLabel:disabled { color: $subtext; }
+
+/* ============================================================
+   外观风格结构令牌：标题字体族随风格切换（纸感=衬线，其余=无衬线）
+   ============================================================ */
+#DrawerTitle, #NameGenTitle, #ShelfTitle, #MsgTitle, #SectionTitle {
+    font-family: $font_title;
+}
+
+/* 角色表单（新增/编辑对话框） */
+#FormLabel { color: $subtext; font-size: 12px; }
+

@@ -2,15 +2,20 @@
 """正文编辑区：章节标题、编辑器、状态栏、悬浮快捷控件。"""
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer,
+    QVariantAnimation, Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
-    QKeySequence,
+    QLinearGradient,
     QPainter,
+    QPainterPath,
     QPalette,
     QPen,
     QPixmap,
+    QRadialGradient,
     QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
@@ -21,6 +26,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QSizePolicy,
     QTextEdit,
     QToolButton,
@@ -32,7 +38,7 @@ from app.models import DEFAULT_FONT_FAMILY, Settings
 from app.services.search import find_all
 from app.services.word_count import count_chars
 from app.ui.icons import IconFactory
-from app.ui.widgets import ToggleSwitch, apply_shadow
+from app.ui.widgets import apply_shadow
 
 
 class PaperFrame(QFrame):
@@ -97,12 +103,27 @@ class NovelEditor(QTextEdit):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setCursorWidth(1)
+        self.adapt_caret()           # 光标粗细跟随初始字号（高度由行高自动决定）
         self.setTabChangesFocus(False)
         self.setPlaceholderText("从这里开始你的故事……")
         self.document().setDocumentMargin(6)
         # 段间空行（空段落）压缩为矮行，视觉段距更接近主流写作软件
         self._compacting = False
         self.document().contentsChange.connect(self._on_contents_change_compact)
+
+    def adapt_caret(self) -> None:
+        """插入符随当前字体自适应：宽度 1–2px（小字 1px、大字 2px）。
+
+        高度沿用 QTextEdit 原生插入符——它按当前文本块的行布局（含字体度量与
+        行距设置）绘制，字号 / 字体 / 行距变化后自动变高变矮，无需手画。
+        在字号变更（字体弹窗实时预览、设置、主题切换）后立即调用，不用等重聚焦。
+        """
+        size = float(self.font().pointSizeF() or 0.0)
+        if size <= 0.0:                  # 像素字号等兜底：直接看行高
+            size = self.fontMetrics().height() / 1.35
+        width = 2 if size >= 16.0 else 1
+        if self.cursorWidth() != width:
+            self.setCursorWidth(width)
 
     # ------------------------------------------------------------------
     def _on_contents_change_compact(self, pos: int, _removed: int, _added: int) -> None:
@@ -226,16 +247,232 @@ class NovelEditor(QTextEdit):
         super().keyPressEvent(event)
 
 
-class SpeedPanel(QFrame):
-    """右侧常驻的码字时速面板（可隐藏，样式参考用户提供的图二）。
+class GlassUnitButton(QToolButton):
+    """时速面板的立体玻璃块圆钮（直径 38px）。
 
-    数值右对齐、深灰色；单位可在 字/分 与 字/时 之间切换并持久化。
+    - 左键循环速度单位：字/分 → 字/时 → 字/分；
+    - 右键菜单：暂停 / 继续统计、立即刷新；
+    - 自绘立体玻璃质感（侧壁亮暗渐变 + 顶部高光 + 底部内阴影），
+      按下 2px 内陷 + 高光收敛（170ms ease-out），切换时字形 90° 旋转淡入。
+    """
+
+    cycled = Signal()
+    tracking_toggled = Signal(bool)
+    refresh_requested = Signal()
+
+    SCALES = ("char", "hour")
+    GLYPH = {"char": "分", "hour": "时"}
+    TIP = {"char": "字/分", "hour": "字/时"}
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(38, 38)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._scale = "char"
+        self._press = 0.0          # 0 松开 / 1 按下（动画插值）
+        self._angle = 0.0         # 字形旋转角
+        self._alpha = 1.0
+        self.setCheckable(False)
+        self.clicked.connect(self._on_click)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+        # 按下内陷 170ms
+        self._press_anim = QVariantAnimation(self)
+        self._press_anim.setDuration(170)
+        self._press_anim.valueChanged.connect(self._set_press)
+        # 字形 90° 旋出 → 换字 → 旋入（合计约 180ms）
+        self._spin_anim = QVariantAnimation(self)
+        self._spin_anim.setDuration(90)
+        self._spin_anim.valueChanged.connect(self._set_spin)
+        self._spin_anim.finished.connect(self._spin_finished)
+        self._spin_phase = 0
+        self._sync_tip()
+
+    # ------------------------------------------------------------------
+    def scale(self) -> str:
+        return self._scale
+
+    def set_scale(self, scale: str) -> None:
+        if scale in self.SCALES and scale != self._scale:
+            self._scale = scale
+            self._sync_tip()
+            self.update()
+
+    def _sync_tip(self) -> None:
+        self.setToolTip(f"切换速度单位：字/分 / 字/时（当前：{self.TIP[self._scale]}）\n"
+                        "右键：暂停统计 / 立即刷新；空格或回车也可切换")
+        self.setAccessibleName(f"速度单位：{self.TIP[self._scale]}（点击切换 字/分、字/时）")
+
+    # ------------------------------------------------------------------
+    def _on_click(self) -> None:
+        self.do_cycle()          # 90° 旋转动画（鼠标与键盘空格/回车都走这里）
+        self.cycled.emit()
+
+    def do_cycle(self) -> None:
+        """左键 / 键盘触发的单位循环（带动画）。"""
+        nxt = self.SCALES[(self.SCALES.index(self._scale) + 1) % len(self.SCALES)]
+        self._spin_phase = 1
+        self._spin_anim.stop()
+        self._spin_anim.setStartValue(0.0)
+        self._spin_anim.setEndValue(1.0)
+        self._spin_anim.start()
+        self._pending_scale = nxt
+
+    def _set_spin(self, v) -> None:
+        self._angle = -90.0 * float(v) if self._spin_phase == 1 else -90.0 + 90.0 * float(v)
+        self._alpha = 1.0 - 0.75 * float(v) if self._spin_phase == 1 else 0.25 + 0.75 * float(v)
+        self.update()
+
+    def _spin_finished(self) -> None:
+        if self._spin_phase == 1:
+            self.set_scale(getattr(self, "_pending_scale", self._scale))
+            self._spin_phase = 2
+            self._spin_anim.stop()
+            self._spin_anim.start()
+        else:
+            self._spin_phase = 0
+            self._angle, self._alpha = 0.0, 1.0
+            self.update()
+
+    def _menu(self, pos: QPoint) -> None:
+        menu = QMenu(self)
+        act_pause = menu.addAction("继续统计" if getattr(self, "_tracking_off", False) else "暂停统计")
+        act_refresh = menu.addAction("立即刷新")
+        chosen = menu.exec(self.mapToGlobal(pos))
+        if chosen is act_pause:
+            self._tracking_off = not getattr(self, "_tracking_off", False)
+            self.tracking_toggled.emit(not self._tracking_off)
+        elif chosen is act_refresh:
+            self.refresh_requested.emit()
+
+    def set_tracking_on(self, on: bool) -> None:
+        self._tracking_off = not on
+        self.update()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.update()
+        super().leaveEvent(event)
+
+    # ------------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._press_anim.stop()
+            self._press_anim.setStartValue(self._press)
+            self._press_anim.setEndValue(1.0)
+            self._press_anim.start()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._press_anim.stop()
+            self._press_anim.setStartValue(self._press)
+            self._press_anim.setEndValue(0.0)
+            self._press_anim.start()
+        super().mouseReleaseEvent(event)
+
+    def _set_press(self, v) -> None:
+        self._press = float(v)
+        self.update()
+
+    # ------------------------------------------------------------------
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pal = self.palette()
+        dark = pal.window().color().lightness() < 128
+        inset = 1.5 + self._press * 2.0     # 按下时整体内陷 2px
+        r = QRectF(inset, inset, self.width() - inset * 2, self.height() - inset * 2)
+
+        path = QPainterPath()
+        path.addEllipse(r)
+        # 底：面板色微竖向渐变（按下时高光收敛、对比略增强）
+        top = pal.button().color().lighter(106 if not dark else 122)
+        bot = pal.button().color().darker(108 if not dark else 118)
+        grad = QLinearGradient(0, r.top(), 0, r.bottom())
+        grad.setColorAt(0, top)
+        grad.setColorAt(1, bot)
+        p.setPen(Qt.NoPen)
+        p.setBrush(grad)
+        p.drawPath(path)
+
+        # 侧壁挤出：2px 亮暗渐变环（左上提亮 / 右下压暗）
+        ring = QPainterPath()
+        rr = r.adjusted(-1.0, -1.0, 1.0, 1.0)
+        ring.addEllipse(rr)
+        ring.addEllipse(r)
+        edge_grad = QLinearGradient(rr.topLeft(), rr.bottomRight())
+        edge_grad.setColorAt(0, QColor(255, 255, 255, 70 if not dark else 46))
+        edge_grad.setColorAt(1, QColor(0, 0, 0, 46 if not dark else 70))
+        p.setBrush(edge_grad)
+        p.drawPath(ring)
+
+        p.save()
+        p.setClipPath(path)
+        # 顶部渐隐高光（hover 提亮 35%；按下时 alpha 收敛）
+        hover_boost = 1.35 if self.underMouse() and self._press < 0.5 else 1.0
+        glow_a = (0.10 if not dark else 0.07) * (1.0 - 0.45 * self._press) * hover_boost
+        gg = QLinearGradient(0, r.top(), 0, r.top() + r.height() * 0.42)
+        gg.setColorAt(0, QColor(255, 255, 255, int(255 * glow_a)))
+        gg.setColorAt(1, QColor(255, 255, 255, 0))
+        p.fillRect(r, gg)
+        # 高光斑（偏左上，随按下收敛）
+        sheen = 0.08 * (1.0 - 0.5 * self._press)
+        cx, cy = r.center().x() - r.width() * 0.16, r.center().y() - r.height() * 0.20
+        rad_g = QRadialGradient(QPointF(cx, cy), r.width() * 0.55)
+        rad_g.setColorAt(0, QColor(255, 255, 255, int(255 * sheen)))
+        rad_g.setColorAt(1, QColor(255, 255, 255, 0))
+        p.setBrush(rad_g)
+        p.drawEllipse(r)
+        # 底部内阴影（按下时加深，强化内陷）
+        band = QRectF(r.left(), r.bottom() - 4.0, r.width(), 4.0)
+        ig = QLinearGradient(0, band.top(), 0, band.bottom())
+        ig.setColorAt(0, QColor(0, 0, 0, 0))
+        ig.setColorAt(1, QColor(0, 0, 0, int(255 * (0.10 + 0.06 * self._press))))
+        p.fillRect(band, ig)
+        p.restore()
+
+        # 焦点环（键盘可用）
+        if self.hasFocus():
+            pen = QPen(QColor("#7C5CFF"), 1.6)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(r.adjusted(-1.5, -1.5, 1.5, 1.5))
+
+        # 字形（90° 旋转 + 淡入淡出）
+        p.save()
+        p.setOpacity(self._alpha)
+        p.translate(r.center().x(), r.center().y())
+        p.rotate(self._angle)
+        font = QFont(self.font())
+        font.setPointSizeF(11)
+        font.setBold(True)
+        p.setFont(font)
+        p.setPen(QColor(pal.buttonText().color()))
+        p.drawText(QRectF(-r.width() / 2, -r.height() / 2, r.width(), r.height()),
+                   Qt.AlignCenter, self.GLYPH[self._scale])
+        p.restore()
+        p.end()
+
+
+class SpeedPanel(QFrame):
+    """右侧常驻的码字时速面板（可隐藏）。
+
+    v3：标题不再带「?」；第二行的控件合并为一颗立体玻璃圆钮，
+    左键在 字/分 ↔ 字/时 两个速度单位间循环（本次字数始终原始口径），
+    右键菜单承担暂停/继续统计与立即刷新。
     """
 
     hide_requested = Signal()
-    unit_changed = Signal(str)  # "per_min" / "per_hour"
+    unit_changed = Signal(str)   # "char" / "hour"
+    tracking_changed = Signal(bool)   # 统计暂停 / 继续（持久化用）
 
-    UNIT_LABELS = {"per_min": "字/分", "per_hour": "字/时"}
+    SCALES = ("char", "hour")
+    SPEED_UNIT = {"char": "字/分", "hour": "字/时"}
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
@@ -248,72 +485,39 @@ class SpeedPanel(QFrame):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(8)
 
-        # 标题行：码字时速 + 帮助提示 …… 右侧关闭（参考竞品布局）
+        # 标题行：码字时速（帮助并入底部说明 + tooltip）…… 右侧关闭
         header = QHBoxLayout()
         header.setSpacing(4)
         title = QLabel("码字时速", self)
         title.setObjectName("SidePanelTitle")
-        header.addWidget(title)
-        help_button = QToolButton(self)
-        help_button.setObjectName("SidePanelHelp")
-        help_button.setText("?")
-        help_button.setCursor(Qt.PointingHandCursor)
-        help_button.setToolTip(
+        title.setToolTip(
             "实时统计本次码字数据：字数、速度、时长与空闲。\n"
             "停写 30 秒后开始记录空闲；打字即停，不清零。"
         )
-        header.addWidget(help_button)
+        header.addWidget(title)
         header.addStretch(1)
         hide_button = QToolButton(self)
         hide_button.setObjectName("DrawerClose")
-        hide_button.setText("×")
         hide_button.setCursor(Qt.PointingHandCursor)
         hide_button.setToolTip("隐藏时速面板")
+        hide_button.setAccessibleName("隐藏时速面板")
         hide_button.clicked.connect(self.hide_requested.emit)
         header.addWidget(hide_button)
+        self._speed_hide_button = hide_button
         layout.addLayout(header)
 
-        # 第二行：状态（左）…… 单位切换 + 刷新（右）
+        # 第二行：状态（左）…… 立体玻璃圆钮（切换显示口径；右键暂停/刷新）
         status_row = QHBoxLayout()
         status_row.setSpacing(6)
         self.status_label = QLabel("未开始", self)
         self.status_label.setObjectName("SidePanelStatus")
         status_row.addWidget(self.status_label)
         status_row.addStretch(1)
-        # 单位拨动开关：胶囊底槽 + 滑动圆钮，字/分 ↔ 字/时（带平滑滑动动画）
-        unit_widget = QWidget(self)
-        unit_row = QHBoxLayout(unit_widget)
-        unit_row.setContentsMargins(0, 0, 0, 0)
-        unit_row.setSpacing(5)
-        self.unit_min_label = QToolButton(unit_widget)
-        self.unit_min_label.setObjectName("UnitLabel")
-        self.unit_min_label.setText("字/分")
-        self.unit_min_label.setCursor(Qt.PointingHandCursor)
-        self.unit_min_label.setToolTip("按每分钟多少字显示码字速度")
-        self.unit_min_label.clicked.connect(lambda: self._set_unit("per_min"))
-        unit_row.addWidget(self.unit_min_label)
-        # checked = 字/时，unchecked = 字/分
-        self.unit_toggle = ToggleSwitch(self._speed_unit == "per_hour", unit_widget)
-        self.unit_toggle.setToolTip("拨动切换单位：字/分 ↔ 字/时")
-        self.unit_toggle.toggled.connect(
-            lambda checked: self._set_unit("per_hour" if checked else "per_min")
-        )
-        unit_row.addWidget(self.unit_toggle)
-        self.unit_hour_label = QToolButton(unit_widget)
-        self.unit_hour_label.setObjectName("UnitLabel")
-        self.unit_hour_label.setText("字/时")
-        self.unit_hour_label.setCursor(Qt.PointingHandCursor)
-        self.unit_hour_label.setToolTip("按每小时多少字显示码字速度")
-        self.unit_hour_label.clicked.connect(lambda: self._set_unit("per_hour"))
-        unit_row.addWidget(self.unit_hour_label)
-        status_row.addWidget(unit_widget)
-        refresh_button = QToolButton(self)
-        refresh_button.setObjectName("PanelToolButton")
-        refresh_button.setText("⟳")
-        refresh_button.setCursor(Qt.PointingHandCursor)
-        refresh_button.setToolTip("立即刷新")
-        refresh_button.clicked.connect(self.refresh)
-        status_row.addWidget(refresh_button)
+        self.unit_button = GlassUnitButton(self)
+        self.unit_button.cycled.connect(self._cycle_unit)
+        self.unit_button.tracking_toggled.connect(self._set_tracking)
+        self.unit_button.refresh_requested.connect(self.refresh)
+        status_row.addWidget(self.unit_button)
         layout.addLayout(status_row)
         layout.addSpacing(6)
 
@@ -325,7 +529,9 @@ class SpeedPanel(QFrame):
 
         layout.addStretch(1)
 
-        hint = QLabel("停写 30 秒后开始记录空闲；打字即停，不清零。", self)
+        hint = QLabel(
+            "点圆钮切换速度单位 字/分 / 字/时（仅显示口径，统计不变）；\n"
+            "右键可暂停统计或立即刷新。停写 30 秒后开始记录空闲，不清零。", self)
         hint.setObjectName("SidePanelKey")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -350,8 +556,16 @@ class SpeedPanel(QFrame):
         self._speed_anim.setInterval(33)   # ~30fps
         self._speed_anim.timeout.connect(self._step_speed_anim)
 
-        self._sync_unit_button()
+        # 统计开关 / 显示口径与圆钮同步（旧 settings 缺键：开统计、按字）
+        self.unit_button.set_tracking_on(bool(getattr(self._settings, "speed_tracking", True)))
+        self.unit_button.set_scale(self._speed_scale)
         self.refresh()
+
+    def apply_icons(self, factory: IconFactory) -> None:
+        """关闭文字字形钮换成全站统一图标（问号钮 v3 已移除，刷新迁入右键菜单）。"""
+        self._speed_hide_button.setText("")
+        self._speed_hide_button.setIconSize(QSize(15, 15))
+        self._speed_hide_button.setIcon(factory.icon("close", 15))
 
     # ------------------------------------------------------------------
     def _add_row(self, layout: QVBoxLayout, key: str) -> QLabel:
@@ -370,36 +584,41 @@ class SpeedPanel(QFrame):
         layout.addWidget(row)
         return value
 
-    def _sync_unit_button(self) -> None:
-        per_hour = self._speed_unit == "per_hour"
-        # checked = 字/时；两侧文字标签高亮当前单位
-        self.unit_toggle.setChecked(per_hour)
-        self.unit_min_label.setProperty("active", not per_hour)
-        self.unit_hour_label.setProperty("active", per_hour)
-        for w in (self.unit_min_label, self.unit_hour_label):
-            w.style().unpolish(w)
-            w.style().polish(w)
-
     @property
-    def _speed_unit(self) -> str:
-        unit = getattr(self._settings, "speed_unit", "per_min")
-        return unit if unit in self.UNIT_LABELS else "per_min"
+    def _speed_scale(self) -> str:
+        scale = str(getattr(self._settings, "speed_unit_scale", "") or "")
+        # 旧配置里可能存的是 "kilo"/"wan"，平滑回退到「字/分」
+        return scale if scale in self.SCALES else "char"
 
-    def _set_unit(self, new_unit: str) -> None:
-        if new_unit not in self.UNIT_LABELS or new_unit == self._speed_unit:
-            self._sync_unit_button()   # 保持选中态与数据一致
-            return
-        self._settings.speed_unit = new_unit
-        self._sync_unit_button()
+    def _cycle_unit(self) -> None:
+        """圆钮：字/分 → 字/时 → 字/分（圆钮自身做旋转动画，这里只换数据口径）。"""
+        nxt = self.SCALES[(self.SCALES.index(self._speed_scale) + 1) % len(self.SCALES)]
+        self._settings.speed_unit_scale = nxt
+        self.unit_button.set_scale(nxt)
         self.refresh()
-        self.unit_changed.emit(new_unit)
+        self.unit_changed.emit(nxt)
+
+    def _set_tracking(self, on: bool) -> None:
+        """右键菜单 / 程序化：暂停 / 继续本次统计（暂停后不累计，不清零已有数据）。"""
+        on = bool(on)
+        self._settings.speed_tracking = on
+        if self._tracker is not None:
+            self._tracker.paused = not on
+        self.unit_button.set_tracking_on(on)   # 双向同步（不回发信号）
+        self.refresh()
+        self.tracking_changed.emit(on)
+
+    def _count_text(self, total: int) -> str:
+        # 本次字数始终显示原始口径（单位只切换「速度」）
+        return f"{total} 字"
 
     def _speed_text(self, per_hour: float) -> str:
+        # 两档速度单位：字/分（整数）与 字/时（1 位小数）
+        if self._speed_scale == "hour":
+            return "0.0 字/时" if per_hour <= 0 else f"{per_hour:.1f} 字/时"
         if per_hour <= 0:
-            return "0 " + self.UNIT_LABELS[self._speed_unit]
-        if self._speed_unit == "per_min":
-            return f"{int(per_hour / 60)} 字/分"
-        return f"{int(per_hour)} 字/时"
+            return "0 字/分"
+        return f"{int(per_hour / 60)} 字/分"
 
     # ------------------------------------------------------------------
     def notify_activity(self) -> None:
@@ -436,6 +655,9 @@ class SpeedPanel(QFrame):
     # ------------------------------------------------------------------
     def set_tracker(self, tracker) -> None:
         self._tracker = tracker
+        if tracker is not None:
+            tracker.paused = not bool(getattr(self._settings, "speed_tracking", True))
+            self.unit_button.set_tracking_on(not tracker.paused)
         self.refresh()
 
     def refresh(self) -> None:
@@ -446,10 +668,11 @@ class SpeedPanel(QFrame):
             self._animate_speed_to(0.0)
             return
         tracker = self._tracker
-        self.status_label.setText(getattr(tracker, "status", "未开始"))
-        self.session_value.setText(f"{tracker.total_chars} 字")
+        paused = bool(getattr(tracker, "paused", False))
+        self.status_label.setText("已暂停" if paused else getattr(tracker, "status", "未开始"))
+        self.session_value.setText(self._count_text(int(tracker.total_chars)))
         self.time_value.setText(tracker.elapsed_text)
-        self._animate_speed_to(float(tracker.speed_per_hour))
+        self._animate_speed_to(0.0 if paused else float(tracker.speed_per_hour))
         self.idle_value.setText(getattr(tracker, "idle_text", "00:00:00"))
 
     def showEvent(self, event) -> None:  # noqa: N802
@@ -649,7 +872,9 @@ class EditorPage(QWidget):
         # 隐形快速滚动滑块（“=”形手柄）：平时隐藏，滚动滚轮时显示 3 秒，拖动可快速滚动
         from app.ui.scroll_float import ScrollFlasher
 
-        self._scroll_flasher = ScrollFlasher(self.editor, Qt.Vertical, inset=12)
+        self._scroll_flasher = ScrollFlasher(
+            self.editor, Qt.Vertical, inset=12, track_scroll=True
+        )
         self.scroll_handle = self._scroll_flasher.handle
 
     def _connect(self) -> None:
@@ -783,12 +1008,6 @@ class EditorPage(QWidget):
         self._position_floating()
         self.speed_panel_toggled.emit(bool(visible))
 
-    def speed_panel_visible(self) -> bool:
-        return self.speed_panel.isVisible()
-
-    def current_chapter_chars(self) -> int:
-        return self._last_count
-
     # ------------------------------------------------------------------
     # 设置
     # ------------------------------------------------------------------
@@ -797,6 +1016,7 @@ class EditorPage(QWidget):
         self.editor.auto_pair = settings.auto_pair
         self.jump_top.setVisible(settings.float_jump)
         self.jump_bottom.setVisible(settings.float_jump)
+        self._scroll_flasher.set_enabled(settings.fast_scroll)
 
         self._apply_typography()
 
@@ -836,6 +1056,8 @@ class EditorPage(QWidget):
             char_format.setFont(font)
             self.editor.mergeCurrentCharFormat(char_format)
             self._applied_font = font_key
+            # 字号变化立即调整光标粗细（高度随新行高自动生效），不等重聚焦
+            self.editor.adapt_caret()
             # 立即重绘视口，字体变化马上可见
             self.editor.viewport().update()
 
@@ -970,9 +1192,6 @@ class EditorPage(QWidget):
         super().resizeEvent(event)
         self._position_floating()
 
-    def eventFilter(self, obj, event) -> bool:  # noqa: N802
-        return super().eventFilter(obj, event)
-
     # ------------------------------------------------------------------
     # 隐形快速滚动滑块（实现见 app/ui/scroll_float.py 的 ScrollFlasher）
     # ------------------------------------------------------------------
@@ -1078,9 +1297,9 @@ class EditorPage(QWidget):
         self.editor.setExtraSelections(selections)
         return len(matches)
 
-    def clear_highlights(self) -> None:
-        self.editor.setExtraSelections([])
-
     def refresh_icons(self, factory: IconFactory) -> None:
         self.jump_top.setIcon(factory.icon("top", 16))
         self.jump_bottom.setIcon(factory.icon("bottom", 16))
+        panel = getattr(self, "speed_panel", None)
+        if panel is not None:
+            panel.apply_icons(factory)

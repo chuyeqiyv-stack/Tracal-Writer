@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPainterPath,
+    QPen, QPixmap, QShortcut,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -33,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from app.models import new_id
 from app.ui.dialogs import MessageBox
+from app.ui.icons import IconFactory, flash_saved
 
 CANVAS_WIDTH = 4800
 CANVAS_HEIGHT = 3000
@@ -57,6 +61,31 @@ NODE_COLORS: list[tuple[str, str]] = [
     ("#F9E2ED", "浅粉"),
     ("#E7E9EE", "浅灰"),
 ]
+
+
+def _color_swatch_icon(value: str, theme: dict, size: int = 16) -> QIcon:
+    """卡片颜色菜单的真色块图标（替代旧 ●/■ 文字字形）。
+
+    空值（跟随主题）画实心圆；自定义色画圆角方块，与卡片本体配色一致。
+    """
+    dpr = 2
+    pm = QPixmap(int(size * dpr), int(size * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.transparent)
+    qp = QPainter(pm)
+    qp.setRenderHint(QPainter.Antialiasing, True)
+    if not value:
+        qp.setPen(Qt.NoPen)
+        qp.setBrush(QColor(theme.get("text", "#1F2329")))
+        qp.drawEllipse(QRectF(3.5, 3.5, size - 7, size - 7))
+    else:
+        bg = QColor(value)
+        qp.setPen(QPen(bg.darker(112), 1.0))
+        qp.setBrush(bg)
+        qp.drawRoundedRect(QRectF(2.5, 2.5, size - 5, size - 5), 3, 3)
+    qp.end()
+    return QIcon(pm)
+
 
 # 八方连接点方向（相对卡片中心的角度偏移比例）
 HANDLES = [
@@ -157,7 +186,7 @@ class OutlineCanvas(QWidget):
         z = self._zoom
         return QPointF(pos.x() / z, pos.y() / z)
 
-    def zoom_at(self, steps: float, device_pos: QPointF) -> None:
+    def zoom_at(self, steps: float, _device_pos: QPointF) -> None:
         """以视口中心为锚缩放（内容整体向中心收放，不跟随光标）。"""
         old = self._zoom
         new = min(ZOOM_MAX, max(ZOOM_MIN, old * (ZOOM_STEP_FACTOR ** steps)))
@@ -550,7 +579,7 @@ class OutlineCanvas(QWidget):
             return
 
         if self._drag_node is not None:
-            node, self._drag_node = self._drag_node, None
+            self._drag_node = None
             self.setCursor(Qt.OpenHandCursor)
             if self._moved:
                 self.changed.emit()
@@ -587,7 +616,8 @@ class OutlineCanvas(QWidget):
         menu.addAction("添加子卡片", lambda: self._add_child(node))
         color_menu = menu.addMenu("卡片颜色")
         for value, name in NODE_COLORS:
-            action = color_menu.addAction(("● " if value == "" else "■ ") + name)
+            action = color_menu.addAction(name)
+            action.setIcon(_color_swatch_icon(value, self.theme))
             action.triggered.connect(
                 lambda _c=False, v=value: self._set_color(node, v)
             )
@@ -818,7 +848,7 @@ class OutlineDialog(QDialog):
         edge_layout.addWidget(self.edge_curve_button)
         bar_layout.addWidget(self.edge_box)
         bar_layout.addStretch(1)
-        hint = QLabel("双击卡片编辑 · Ctrl+滚轮缩放 · 先选直线/曲线再从连接点拖出（每条连线样式独立） · 拖到边界点「＋」扩展画布", bar)
+        hint = QLabel("双击卡片编辑 · Ctrl+滚轮缩放 · 先选直线/曲线再从连接点拖出（每条连线样式独立） · 拖到边界点边缘按钮扩展画布", bar)
         hint.setObjectName("DrawerHint")
         bar_layout.addWidget(hint)
         self.save_button = QPushButton("保存", bar)
@@ -839,6 +869,7 @@ class OutlineDialog(QDialog):
         save_sc = QShortcut(QKeySequence("Ctrl+S"), self)
         save_sc.activated.connect(self._flush_save)
 
+        self._theme = theme
         self.canvas = OutlineCanvas(theme, self)
         self.canvas.set_data(self.item)
         self.canvas.changed.connect(self._collect)
@@ -855,6 +886,9 @@ class OutlineDialog(QDialog):
         self._h_flasher = ScrollFlasher(self.scroll, Qt.Horizontal, inset=8)
         self._v_flasher = ScrollFlasher(self.scroll, Qt.Vertical, inset=8)
         self.scroll.setWidget(self.canvas)
+        # 画布自行处理 Ctrl+滚轮缩放，补挂画布监听保证滑块能浮现
+        self._h_flasher.watch(self.canvas)
+        self._v_flasher.watch(self.canvas)
         layout.addWidget(self.scroll, 1)
 
         # 四向边界「＋」按钮：视口贴到某条边界时出现，点击扩容画布
@@ -887,11 +921,14 @@ class OutlineDialog(QDialog):
     def _make_plus_button(self, side: str) -> QToolButton:
         button = QToolButton(self.scroll.viewport())
         button.setObjectName("FloatButton")
-        button.setText("＋")
         button.setCursor(Qt.PointingHandCursor)
         button.setFixedSize(36, 36)
+        button.setIconSize(QSize(18, 18))
+        button.setIcon(IconFactory(self._theme["text"]).icon("add", 18))
         names = {"left": "左", "right": "右", "top": "上", "bottom": "下"}
-        button.setToolTip("向%s扩展画布" % names.get(side, side))
+        tip = "向%s扩展画布" % names.get(side, side)
+        button.setToolTip(tip)
+        button.setAccessibleName(tip)
         button.hide()
         return button
 
@@ -989,8 +1026,7 @@ class OutlineDialog(QDialog):
     def _flush_save(self) -> None:
         """立即保存（保存按钮 / Ctrl+S / 关闭窗口时调用）。"""
         self._collect()
-        self.save_button.setText("已保存 ✓")
-        QTimer.singleShot(1400, lambda: self.save_button.setText("保存"))
+        flash_saved(self.save_button, IconFactory(self._theme["text"]))
 
     def _export_json(self) -> None:
         """把大纲导出为 JSON 文件（导出路径实时选择）。"""
@@ -1015,6 +1051,10 @@ class OutlineDialog(QDialog):
             return
         MessageBox.information(self, "导出成功", f"已导出到：\n{path}")
 
+    def flush_pending(self) -> None:
+        """主窗口退出前兜底保存。"""
+        self._collect()
+
     def closeEvent(self, event) -> None:  # noqa: N802
         self._collect()  # 关闭前兜底保存
         super().closeEvent(event)
@@ -1024,3 +1064,13 @@ class OutlineDialog(QDialog):
 
     def set_theme(self, theme: dict) -> None:
         self.canvas.set_theme(theme)
+        self._theme = theme
+        for attr, sides in (
+            ("_edge_buttons", ("left", "right", "top", "bottom")),
+        ):
+            buttons = getattr(self, attr, None)
+            if isinstance(buttons, dict):
+                for side in sides:
+                    btn = buttons.get(side)
+                    if btn is not None:
+                        btn.setIcon(IconFactory(theme["text"]).icon("add", 18))

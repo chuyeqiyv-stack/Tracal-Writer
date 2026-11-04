@@ -2,7 +2,7 @@
 """左侧边栏：目录树（卷 / 章节）与“相关”设定页签。"""
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QFont, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -181,10 +181,6 @@ class SidebarWidget(QWidget):
         else:
             self.tab_related.setChecked(True)
 
-    def show_toc(self) -> None:
-        """切换到“目录”页签（新建章节后使用）。"""
-        self.set_page_index(0)
-
     def _emit_new_chapter(self) -> None:
         if not self._book:
             return
@@ -268,20 +264,6 @@ class SidebarWidget(QWidget):
     @staticmethod
     def _volume_label(title: str, expanded: bool) -> str:
         return f"{'▾' if expanded else '▸'} {title}"
-
-    def update_chapter_count(self, chapter_id: str, count: int) -> None:
-        item = self._chapter_items.get(chapter_id)
-        if item is None:
-            return
-        item.setText(1, f"{count}字")
-        item.setData(1, Qt.UserRole + 1, int(count))
-        parent = item.parent()
-        if parent is not None:
-            total = sum(
-                int(parent.child(i).data(1, Qt.UserRole + 1) or 0)
-                for i in range(parent.childCount())
-            )
-            parent.setText(1, f"{total}字")
 
     def select_chapter(self, chapter_id: str) -> None:
         item = self._chapter_items.get(chapter_id)
