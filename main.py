@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import sys
 
+from app import startup_trace
+
 from PySide6.QtCore import QLibraryInfo, Qt, QTimer, QTranslator
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -19,6 +21,8 @@ from app import config
 from app.single_instance import InstanceLock
 from app.storage import Storage
 from app.ui.main_window import MainWindow
+
+startup_trace.mark("imports")
 
 
 def main() -> int:
@@ -38,6 +42,7 @@ def main() -> int:
     # Fusion 风格在各平台表现一致，也方便自定义 QSS 主题
     app.setStyle("Fusion")
     app.setFont(QFont(config.DEFAULT_FONT_FAMILY, 10))
+    startup_trace.mark("qapp")
 
     # Qt 自带组件（QFileDialog / QInputDialog 等）的按钮与文案翻译为中文
     translations_path = QLibraryInfo.path(QLibraryInfo.TranslationsPath)
@@ -62,9 +67,12 @@ def main() -> int:
         )
         return 1
     app.aboutToQuit.connect(lock.release)
+    startup_trace.mark("lock")
 
     storage = Storage()
     settings = storage.load_settings()
+    startup_trace.mark("storage")
+    startup_trace.dump("boot")
 
     if getattr(settings, "boot_animation", True):
         # 启动动画与主窗口初始化并行：先让莲花首帧上屏，下一事件循环节拍再构造主窗口。

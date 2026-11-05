@@ -23,12 +23,13 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QPushButton,
+    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from app import config
+from app import config, startup_trace
 from app.models import Book, Chapter, RelatedItem, Settings, Volume, create_book, new_id, next_chapter_title
 from app.services import formatter
 from app.services.achievements import (
@@ -38,7 +39,15 @@ from app.services.achievements import (
     ACHIEVEMENTS,
 )
 from app.services.stats import WritingSpeedTracker
-from app.services.webdav_sync import WebDavError, download_backup, upload_backup
+from app.services.webdav_sync import (
+    WebDavError,
+    create_remote_dir,
+    delete_old_backups,
+    download_backup,
+    normalize_remote_dir,
+    test_connection,
+    upload_backup,
+)
 from app.services.word_count import count_chars
 from app.storage import Storage
 from app.ui.bookshelf import BookshelfPage
@@ -65,6 +74,7 @@ from app.ui.map import MapDialog
 from app.ui.outline import OutlineDialog
 from app.ui.settings_panel import SettingsDrawer
 from app.ui.sidebar import SidebarWidget
+from app.ui.snippets import SnippetsPanel
 from app.ui.theme import base_theme, build_palette, build_qss, build_theme
 from app.ui.timeline import TimelineDialog
 from app.ui.widgets import BackgroundWidget, ToolbarButton
@@ -85,15 +95,68 @@ class WebDavWorker(QThread):
     def run(self) -> None:
         try:
             if self.mode == "upload":
-                upload_backup(self.settings, self.base_dir)
+                upload_backup(self.settings, self.base_dir,
+                              getattr(self.settings, "sync_covers_mode", "thumb"))
                 self.finished_ok.emit("备份已成功上传到云端。")
+            elif self.mode == "prune":
+                removed, kept = delete_old_backups(self.settings, 3)
+                if removed:
+                    self.finished_ok.emit(
+                        f"已删除 {len(removed)} 份旧备份，保留最近 {len(kept)} 份。")
+                else:
+                    self.finished_ok.emit(
+                        f"没有需要删除的旧备份（云端共 {len(kept)} 份，保留最近 3 份）。")
             else:
-                files = download_backup(self.settings, self.base_dir)
-                self.finished_ok.emit(f"已从云端恢复 {len(files)} 个数据文件。")
+                report: dict = {}
+                files = download_backup(self.settings, self.base_dir, report)
+                text = f"已从云端恢复 {len(files)} 个数据文件。"
+                used = int(report.get("thumbs_used", 0))
+                if used:
+                    text += (f"\n其中 {used} 张封面用云端缩略图代替（原图未随备份同步）。"
+                              "如需原图，请回到原设备重新上传 full 模式备份。")
+                self.finished_ok.emit(text)
         except WebDavError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"同步失败：{exc}")
+
+
+class WebDavTestWorker(QThread):
+    """「测试连接」后台线程：PROPFIND 目录 + 缺目录自动 MKCOL + PUT/DELETE 写探测。"""
+
+    finished_result = Signal(object)   # dict: ok / missing / text
+    failed = Signal(str)
+
+    def __init__(self, settings: Settings, parent=None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+
+    def run(self) -> None:
+        try:
+            self.finished_result.emit(test_connection(self.settings))
+        except WebDavError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"测试连接失败：{exc}")
+
+
+class WebDavCreateDirWorker(QThread):
+    """「创建该目录」后台线程：逐级 MKCOL（≤3 级）后复测。"""
+
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, settings: Settings, parent=None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+
+    def run(self) -> None:
+        try:
+            self.finished_ok.emit(create_remote_dir(self.settings))
+        except WebDavError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"创建目录失败：{exc}")
 
 
 class MainWindow(QMainWindow):
@@ -101,8 +164,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self, storage: Storage) -> None:
         super().__init__()
+        startup_trace.reset()
         self.storage = storage
         self.settings: Settings = storage.load_settings()
+        self._sync_target = self._sync_target_tuple()   # 同步目标快照（变更即重置同步状态）
         self.book: Book | None = None
         self.current_chapter_id = ""
         self._editor_chapter_id = ""     # 编辑器里承载的章节 id（防止把旧文本存进新章节）
@@ -116,10 +181,15 @@ class MainWindow(QMainWindow):
         self._words_pending = 0          # 尚未落盘的今日键盘打字字数
         self._last_auto_snapshot = 0.0   # 上一次自动快照时间（去重用）
         self._webdav_worker: WebDavWorker | None = None
+        self._webdav_test_worker: WebDavTestWorker | None = None
+        self._webdav_create_worker: WebDavCreateDirWorker | None = None
+        self._auto_sync_failures = 0
         self._timeline_dialogs: list[TimelineDialog] = []
         self._outline_dialogs: list[OutlineDialog] = []
         self._map_dialogs: dict[str, MapDialog] = {}
         self._note_windows: dict[str, NoteEditorWindow] = {}
+        self._snippets_visible = False
+        self._snippets_panel: SnippetsPanel | None = None
         self._load_imported_fonts()
 
         self._find_dialog: FindReplaceDialog | None = None
@@ -129,17 +199,23 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(config.APP_NAME)
         self.resize(1360, 880)
         self.setMinimumSize(1080, 680)
+        startup_trace.mark("mw_setup")
 
         self._build_ui()
+        startup_trace.mark("mw_ui")
         self._build_timers()
         self._build_shortcuts()
         self._connect_signals()
+        startup_trace.mark("mw_signals")
 
         self._ensure_first_run_demo()
         self.apply_theme()
+        startup_trace.mark("mw_theme")
         self.show_bookshelf()
+        startup_trace.mark("mw_shelf")
         # 任务G：封面懒迁移/孤儿扫描延后到首帧之后（不压构造耗时）；有变更再刷书架
         QTimer.singleShot(0, self._housekeep_covers_deferred)
+        startup_trace.dump("mainwindow")
 
     def _housekeep_covers_deferred(self) -> None:
         """首帧后整理 covers/（data-URI 外置 / 旧命名哈希化 / 孤儿清理）。"""
@@ -188,17 +264,30 @@ class MainWindow(QMainWindow):
 
         self.shelf = BookshelfPage(self.stack, storage=self.storage)
         self.stack.addWidget(self.shelf)
+        startup_trace.mark("ui_shelf")
 
         self.workspace = QWidget(self.stack)
         workspace_layout = QHBoxLayout(self.workspace)
         workspace_layout.setContentsMargins(0, 0, 0, 0)
         workspace_layout.setSpacing(0)
         self.sidebar = SidebarWidget(self.workspace)
+        startup_trace.mark("ui_sidebar")
         self.editor_page = EditorPage(self.settings, self.workspace)
+        startup_trace.mark("ui_editor")
+        # 片段栏按需创建：首次展开时才构造面板并读取 snippets.json，
+        # 避免每次启动都为未展开的面板付出构造 / 解析成本。
         workspace_layout.addWidget(self.sidebar)
         workspace_layout.addWidget(self._build_side_toggle())
-        workspace_layout.addWidget(self.editor_page, 1)
+        # 正文与右侧片段栏：可拖拽分栏；片段栏收起时正文自动占满
+        self.editor_split = QSplitter(Qt.Horizontal, self.workspace)
+        self.editor_split.setObjectName("EditorSplit")
+        self.editor_split.setChildrenCollapsible(False)
+        self.editor_split.setHandleWidth(6)
+        self.editor_split.addWidget(self.editor_page)
+        self.editor_split.setStretchFactor(0, 1)
+        workspace_layout.addWidget(self.editor_split, 1)
         self.stack.addWidget(self.workspace)
+        startup_trace.mark("ui_workspace")
 
         # 工具栏依赖 editor_page 的撤销 / 重做方法，因此放在工作区之后创建
         self.topbar = self._build_topbar()
@@ -206,8 +295,41 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.top_stack)
         root_layout.addWidget(self.stack, 1)
 
-        self.drawer = SettingsDrawer(self.settings, self.root)
-        self.drawer.raise_()
+        self.drawer = SettingsDrawer(self.settings, self)
+        startup_trace.mark("ui_drawer")
+
+    @property
+    def snippets_panel(self) -> SnippetsPanel:
+        """片段栏按需创建：首次展开（或外部显式访问）时才构造并读盘。"""
+        return self._ensure_snippets_panel()
+
+    def _ensure_snippets_panel(self) -> SnippetsPanel:
+        panel = self._snippets_panel
+        if panel is not None:
+            return panel
+        startup_trace.mark("snippets_begin")
+        panel = SnippetsPanel(self.storage, self.settings, self.workspace)
+        startup_trace.mark("snippets_repo")
+        panel.close_requested.connect(lambda: self.toggle_snippets_panel(False))
+        panel.focus_editor_requested.connect(self.editor_page.focus_editor)
+        panel.set_theme(getattr(self, "_theme", {}))
+        panel.set_fast_scroll(getattr(self.settings, "fast_scroll", True))
+        book_title, chapter_title = self._snippets_context()
+        panel.set_context(book_title, chapter_title)
+        self.editor_split.addWidget(panel)
+        self.editor_split.setStretchFactor(1, 0)
+        panel.hide()
+        handle = self.editor_split.handle(1)
+        if handle is not None:
+            handle.hide()
+        self._snippets_panel = panel
+        return panel
+
+    def _snippets_context(self) -> tuple[str, str]:
+        if self.book is None:
+            return "", ""
+        _volume, chapter = self.book.find_chapter(self.current_chapter_id)
+        return self.book.title, (chapter.title if chapter is not None else "")
 
     def _build_side_toggle(self) -> QFrame:
         """目录侧栏旁的细条：点击箭头收起 / 展开左侧目录。"""
@@ -358,6 +480,17 @@ class MainWindow(QMainWindow):
         self.sidebar_timer.setInterval(400)
         self.sidebar_timer.timeout.connect(self._refresh_sidebar_counts)
 
+        # 片段栏拖拽宽度：停手 300ms 后写入 Settings，避免拖动过程频繁落盘
+        self.snippets_width_timer = QTimer(self)
+        self.snippets_width_timer.setSingleShot(True)
+        self.snippets_width_timer.setInterval(300)
+        self.snippets_width_timer.timeout.connect(self._persist_snippets_width)
+
+        # 自动同步：按档位在后台静默上传，不弹窗、不阻塞主线程
+        self.auto_sync_timer = QTimer(self)
+        self.auto_sync_timer.timeout.connect(self._auto_sync_tick)
+        self._restart_auto_sync_timer()
+
     def _build_shortcuts(self) -> None:
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         save_shortcut.activated.connect(self._manual_save)
@@ -451,6 +584,10 @@ class MainWindow(QMainWindow):
         self.sidebar.new_related_requested.connect(self.add_related)
         self.sidebar.edit_related_requested.connect(self.edit_related)
         self.sidebar.delete_related_requested.connect(self.delete_related)
+        self.sidebar.snippets_requested.connect(self.toggle_snippets_panel)
+
+        # 右侧文笔仿写片段栏的信号在面板创建时连接（懒加载）
+        self.editor_split.splitterMoved.connect(self._on_editor_split_moved)
 
         self.editor_page.content_edited.connect(self._on_content_edited)
         self.editor_page.title_edited.connect(self._on_title_edited)
@@ -477,7 +614,14 @@ class MainWindow(QMainWindow):
         self.drawer.profile_changed.connect(self._on_profile_changed)
         self.drawer.webdav_upload_requested.connect(self.webdav_upload)
         self.drawer.webdav_restore_requested.connect(self.webdav_restore)
+        self.drawer.webdav_test_requested.connect(self.webdav_test)
+        self.drawer.webdav_create_dir_requested.connect(self.webdav_create_dir)
+        self.drawer.webdav_prune_requested.connect(self.webdav_prune)
+        self.drawer.auto_sync_now_requested.connect(self.webdav_upload)
         self.drawer.data_dir_change_requested.connect(self.change_data_dir)
+        self.drawer.geometry_changed.connect(
+            lambda: self.storage.save_settings(self.settings)
+        )
         self.drawer.set_data_dir(str(self.storage.base_dir))
         self.drawer.opened.connect(
             lambda: (
@@ -510,8 +654,10 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self) -> None:
         """根据设置重建调色板、QSS、图标与各处颜色。"""
+        startup_trace.mark("theme_begin")
         theme = build_theme(self.settings)
         self._theme = theme
+        startup_trace.mark("theme_dict")
         # 外观风格的浮层阴影令牌同步给 motion（在构建任何浮层前生效）
         from app.ui import motion
         motion.set_elevation_tokens(theme)
@@ -527,13 +673,22 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setPalette(build_palette(theme))
-            app.setStyleSheet(build_qss(theme))
+            qss = build_qss(theme)
+            startup_trace.mark("theme_qss_build")
+            app.setStyleSheet(qss)
+            startup_trace.mark("theme_qss_apply")
 
         self._icon_factory = IconFactory(theme["icon"], active_color=theme["accent"])
         self._refresh_icons()
+        startup_trace.mark("theme_icons")
         self.root.set_theme(theme)
         self.editor_page.apply_settings(self.settings)
         self.editor_page.apply_writing_background()
+        if self._snippets_panel is not None:
+            self._snippets_panel.set_theme(theme)
+            self._snippets_panel.set_fast_scroll(
+                getattr(self.settings, "fast_scroll", True)
+            )
         self.drawer.refresh_values()
         self.drawer.repaint_switches()
         self.drawer.refresh_surface()
@@ -840,6 +995,9 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(1)
             self.open_chapter(self.current_chapter_id)
             self.editor_page.focus_editor()
+            # 上次退出时若展开着仿写区，打开书籍后还原（面板本身懒加载，不预建）
+            if getattr(self.settings, "snippets_open", False) and not self._snippets_visible:
+                self.toggle_snippets_panel(True)
 
     def _load_current_book(self, book_id: str, keep_chapter: bool = False) -> None:
         book = self.storage.load_book(book_id)
@@ -852,6 +1010,8 @@ class MainWindow(QMainWindow):
         self.current_volume_id = volume.id if volume is not None else ""
         self._recount_all()
         self.sidebar.set_book(book, self.counts, self.current_chapter_id)
+        if self._snippets_panel is not None:
+            self._snippets_panel.set_context(book.title, "")
         self.storage.set_last_book(book.id)
 
     def open_chapter(self, chapter_id: str) -> None:
@@ -863,6 +1023,8 @@ class MainWindow(QMainWindow):
             return
         self.current_chapter_id = chapter_id
         self.current_volume_id = volume.id if volume is not None else ""
+        if self._snippets_panel is not None:
+            self._snippets_panel.set_context(self.book.title, chapter.title)
         self.editor_page.setDisabled(False)
         self.editor_page.load_text(chapter.title, chapter.content)
         self._editor_chapter_id = chapter_id
@@ -1855,6 +2017,8 @@ class MainWindow(QMainWindow):
 
         # 保存当前未落盘的数据，确保迁移的是最新内容
         self.flush()
+        if self._snippets_panel is not None:
+            self._snippets_panel.flush_pending()
         self.storage.save_settings(self.settings)
 
         try:
@@ -1871,7 +2035,7 @@ class MainWindow(QMainWindow):
             target.mkdir(parents=True, exist_ok=True)
             for name in (
                 "library.json", "settings.json", "map_global.json",
-                "words_daily.json", "achievements.json",
+                "words_daily.json", "achievements.json", "snippets.json",
             ):
                 src = current / name
                 if src.exists():
@@ -1996,12 +2160,205 @@ class MainWindow(QMainWindow):
         self._webdav_worker = worker
 
     def _on_webdav_ok(self, message: str) -> None:
+        worker = self._webdav_worker
+        mode = worker.mode if worker is not None else ""
         MessageBox.information(self, "云同步", message)
-        if self._webdav_worker is not None and self._webdav_worker.mode == "restore":
+        if mode == "restore":
             self._reload_after_restore()
+        elif mode == "upload":
+            # 手动上传成功后记下指纹，避免紧接着的自动同步重复上传
+            self.settings.auto_sync_signature = self._data_signature()
+            self._record_sync_result(True, message="上传成功")
 
     def _on_webdav_failed(self, message: str) -> None:
+        self._record_sync_result(False, message=message)
         MessageBox.warning(self, "云同步失败", message)
+
+    def _record_sync_result(self, ok: bool, message: str = "") -> None:
+        """更新「上次同步 HH:MM · 成功/失败」，失败原因截断成一行写进面板。"""
+        now = time.strftime("%H:%M")
+        self.settings.auto_sync_last_time = now
+        self.settings.auto_sync_last_ok = bool(ok)
+        self.storage.save_settings(self.settings)
+        if ok:
+            self.drawer.set_auto_sync_status(f"上次同步 {now} · 成功")
+        else:
+            brief = (message or "未知原因").splitlines()[0][:120]
+            self.drawer.set_auto_sync_status(f"上次同步 {now} · 失败：{brief}")
+
+    # ------------------------------------------------------------------
+    # 自动同步：后台静默上传（无弹窗、主线程不做网络 IO）
+    # ------------------------------------------------------------------
+    def _sync_target_tuple(self) -> tuple:
+        """同步目标标识（地址 / 账号 / 应用密码 / 目录），任一变化都算换了目标。"""
+        s = self.settings
+        return ((s.webdav_url or "").strip(), (s.webdav_user or "").strip(),
+                s.webdav_password or "", normalize_remote_dir(s.webdav_dir or ""))
+
+    def _reset_sync_state_on_target_change(self) -> bool:
+        """切换账号 / 目录 / 地址后清空同步状态：指纹清空 → 下一次同步强制上传。
+
+        只清「上次同步时间/上次成功/内容指纹/连续失败计数」，不动本地数据，
+        也不删云端任何文件（旧账号的备份仍在旧账号目录里）。
+        """
+        target = self._sync_target_tuple()
+        if target == self._sync_target:
+            return False
+        self._sync_target = target
+        self._auto_sync_failures = 0
+        self.settings.auto_sync_signature = ""
+        self.settings.auto_sync_last_time = ""
+        self.settings.auto_sync_last_ok = False
+        self.storage.save_settings(self.settings)
+        self.drawer.set_auto_sync_status("尚未同步（已切换同步目标，首次会完整上传）")
+        return True
+
+    def _restart_auto_sync_timer(self) -> None:
+        """按当前设置启停自动同步；关闭或凭据不全时保持停止。"""
+        self.auto_sync_timer.stop()
+        if not self.settings.auto_sync_enabled:
+            return
+        if not ((self.settings.webdav_url or "").strip()
+                and (self.settings.webdav_user or "").strip()
+                and (self.settings.webdav_password or "").strip()):
+            return
+        try:
+            minutes = int(self.settings.auto_sync_interval or 30)
+        except (TypeError, ValueError):
+            minutes = 30
+        minutes = max(10, min(60, minutes))
+        self.auto_sync_timer.setInterval(minutes * 60 * 1000)
+        self.auto_sync_timer.start()
+
+    def _data_signature(self) -> str:
+        """本地 JSON 数据指纹（内容哈希 + 大小）。
+
+        不把 settings.json 算进去：同步状态（上次同步时间/指纹）本身就写在
+        settings.json 里，若计入会自己触发自己，永远「有变化」。
+        """
+        import hashlib
+
+        digest = hashlib.sha1()
+        try:
+            files = sorted(self.storage.base_dir.rglob("*.json"))
+        except OSError:
+            return ""
+        for path in files:
+            if path.name == "settings.json" or ".tmp" in path.name:
+                continue
+            try:
+                digest.update(path.relative_to(self.storage.base_dir).as_posix().encode("utf-8"))
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1 << 20), b""):
+                        digest.update(chunk)
+            except OSError:
+                continue
+        return digest.hexdigest()
+
+    def _auto_sync_tick(self) -> None:
+        """到点后：内容未变不发请求；有变化则起后台线程静默上传。"""
+        if not self.settings.auto_sync_enabled:
+            self.auto_sync_timer.stop()
+            return
+        if not ((self.settings.webdav_url or "").strip()
+                and (self.settings.webdav_user or "").strip()
+                and (self.settings.webdav_password or "").strip()):
+            return
+        if self._webdav_worker is not None and self._webdav_worker.isRunning():
+            return
+        self.flush()
+        signature = self._data_signature()
+        if signature and signature == (self.settings.auto_sync_signature or ""):
+            return
+        self.storage.save_settings(self.settings)
+        worker = WebDavWorker("upload", self.settings, self.storage.base_dir, self)
+        worker.finished_ok.connect(
+            lambda _msg, sig=signature: self._on_auto_sync_done(True, "", sig)
+        )
+        worker.failed.connect(lambda msg: self._on_auto_sync_done(False, msg))
+        worker.start()
+        self._webdav_worker = worker
+
+    def _on_auto_sync_done(self, ok: bool, message: str, signature: str = "") -> None:
+        worker, self._webdav_worker = self._webdav_worker, None
+        if worker is not None:
+            worker.deleteLater()
+        if ok:
+            self._auto_sync_failures = 0
+            self.settings.auto_sync_signature = signature
+            self._record_sync_result(True)
+            return
+        self._auto_sync_failures += 1
+        brief = (message or "未知原因").splitlines()[0][:120]
+        if self._auto_sync_failures >= 3:
+            # 连续失败 3 次：本轮不再重试，等下一周期；状态行常驻可读原因
+            now = time.strftime("%H:%M")
+            self.settings.auto_sync_last_time = now
+            self.settings.auto_sync_last_ok = False
+            self.storage.save_settings(self.settings)
+            self.drawer.set_auto_sync_status(
+                f"自动同步连续失败 {self._auto_sync_failures} 次，已暂停到下一周期：{brief}"
+            )
+            return
+        self._record_sync_result(False, message)
+
+    def webdav_prune(self) -> None:
+        """清理云端旧备份：只保留最近 3 份（DELETE，404 视为已不存在）。"""
+        if self._webdav_worker is not None and self._webdav_worker.isRunning():
+            MessageBox.information(self, "云同步", "上一次同步还在进行中，请稍候。")
+            return
+        if not self._confirm(
+                "云同步", "删除云端旧备份，只保留最近 3 份？此操作不可撤销。"):
+            return
+        self.storage.save_settings(self.settings)
+        worker = WebDavWorker("prune", self.settings, self.storage.base_dir, self)
+        worker.finished_ok.connect(self._on_webdav_ok)
+        worker.failed.connect(self._on_webdav_failed)
+        worker.start()
+        self._webdav_worker = worker
+
+    def webdav_test(self) -> None:
+        """设置面板「测试连接」：后台 PROPFIND 同步目录，结果只写面板状态行。"""
+        if (self._webdav_test_worker is not None
+                and self._webdav_test_worker.isRunning()):
+            return
+        if not ((self.settings.webdav_url or "").strip()
+                and (self.settings.webdav_user or "").strip()
+                and (self.settings.webdav_password or "").strip()):
+            self.drawer.set_auto_sync_status(
+                "测试连接：请先填写 WebDAV 地址、账号与应用密码"
+            )
+            return
+        self.storage.save_settings(self.settings)
+        self.drawer.set_create_dir_available(False)
+        worker = WebDavTestWorker(self.settings, self)
+        worker.finished_result.connect(self._on_test_result)
+        worker.failed.connect(
+            lambda text: self.drawer.set_auto_sync_status("测试连接失败：" + text)
+        )
+        worker.start()
+        self._webdav_test_worker = worker
+        self.drawer.set_auto_sync_status("正在测试连接…")
+
+    def _on_test_result(self, result: dict) -> None:
+        self.drawer.set_auto_sync_status(str(result.get("text", "")))
+        # 三步（读 + 建目录 + 写探测）任一失败且目录缺失时，就地出现「创建该目录」
+        self.drawer.set_create_dir_available(bool(result.get("missing")))
+
+    def webdav_create_dir(self) -> None:
+        """按需创建同步目录（逐级 MKCOL ≤3 级），成功后复测一次。"""
+        if (self._webdav_create_worker is not None
+                and self._webdav_create_worker.isRunning()):
+            return
+        self.drawer.set_create_dir_available(False)
+        worker = WebDavCreateDirWorker(self.settings, self)
+        worker.finished_ok.connect(self.drawer.set_auto_sync_status)
+        worker.failed.connect(
+            lambda text: self.drawer.set_auto_sync_status("创建目录失败：" + text)
+        )
+        worker.start()
+        self._webdav_create_worker = worker
+        self.drawer.set_auto_sync_status("正在创建目录…")
 
     def _reload_after_restore(self) -> None:
         """恢复后重新加载全部数据。"""
@@ -2011,6 +2368,10 @@ class MainWindow(QMainWindow):
         cover_cache_clear()
         self.settings = self.storage.load_settings()
         self._load_imported_fonts()
+        if self._snippets_panel is not None:
+            self._snippets_panel.reload()
+        if self._snippets_visible:
+            self._apply_snippets_width()
         self.achievements = AchievementManager(self.storage)
         self._words_pending = 0
         self.book = None
@@ -2032,6 +2393,74 @@ class MainWindow(QMainWindow):
 
     def toggle_drawer(self) -> None:
         self.drawer.toggle()
+
+    # ==================================================================
+    # 文笔仿写片段栏（右侧，可拖拽宽度）
+    # ==================================================================
+    def toggle_snippets_panel(self, show: bool | None = None) -> None:
+        target = (not self._snippets_visible) if show is None else bool(show)
+        if target == self._snippets_visible:
+            self.sidebar.btn_snippets.setChecked(target)
+            return
+        if target:
+            panel = self._ensure_snippets_panel()
+            self._snippets_visible = True
+            self.sidebar.btn_snippets.setChecked(True)
+            self._apply_snippets_width()
+            panel.show()
+            handle = self.editor_split.handle(1)
+            if handle is not None:
+                handle.show()
+            panel.raise_()
+            self._remember_snippets_open(True)
+            return
+        # 先记住拖拽宽度，再真正收起（收起后宽度会变 0）
+        self._persist_snippets_width()
+        self._snippets_visible = False
+        self.sidebar.btn_snippets.setChecked(False)
+        if self._snippets_panel is not None:
+            self._snippets_panel.hide()
+        handle = self.editor_split.handle(1)
+        if handle is not None:
+            handle.hide()
+        self._remember_snippets_open(False)
+
+    def _remember_snippets_open(self, opened: bool) -> None:
+        """面板开合状态写回 Settings（与宽度字段一起，不新增重复键）。"""
+        if bool(getattr(self.settings, "snippets_open", False)) == bool(opened):
+            return
+        self.settings.snippets_open = bool(opened)
+        self.storage.save_settings(self.settings)
+
+    def _snippets_max_width(self) -> int:
+        """片段栏最大宽度：不超过窗口宽度的 45%。"""
+        return max(220, int(self.width() * 0.45))
+
+    def _apply_snippets_width(self) -> None:
+        total = self.editor_split.width()
+        if total <= 0:
+            total = max(1, self.workspace.width() - self.sidebar.width() - 16)
+        maxw = min(self._snippets_max_width(), max(220, total - 320))
+        if self._snippets_panel is not None:
+            self._snippets_panel.setMaximumWidth(self._snippets_max_width())
+        want = int(getattr(self.settings, "snippets_width", 320) or 320)
+        want = max(220, min(want, maxw))
+        self.editor_split.setSizes([max(0, total - want), want])
+
+    def _on_editor_split_moved(self, _pos: int, _index: int) -> None:
+        if self._snippets_visible:
+            self.snippets_width_timer.start()
+
+    def _persist_snippets_width(self) -> None:
+        self.snippets_width_timer.stop()
+        if not self._snippets_visible:
+            return
+        if self._snippets_panel is None:
+            return
+        width = max(220, min(self._snippets_panel.width(), self._snippets_max_width()))
+        if width != self.settings.snippets_width:
+            self.settings.snippets_width = width
+            self.storage.save_settings(self.settings)
 
     def new_chapter(self, volume_id: str) -> None:
         if self.book is None:
@@ -2163,6 +2592,10 @@ class MainWindow(QMainWindow):
     # ==================================================================
     def _on_settings_changed(self) -> None:
         self.storage.save_settings(self.settings)
+        # 账号 / 应用密码 / 同步目录 / WebDAV 地址变更：清空同步状态，首次强制上传
+        self._reset_sync_state_on_target_change()
+        # 自动同步开关 / 档位 / 凭据变化后，按新设置重启定时器
+        self._restart_auto_sync_timer()
         # 深浅色 / 颜色自定义需要整体刷新；其余只需要局部应用
         self.apply_theme()
 
@@ -2175,14 +2608,24 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self.drawer.relayout()
+        if self._snippets_visible and self._snippets_panel is not None:
+            maxw = self._snippets_max_width()
+            self._snippets_panel.setMaximumWidth(maxw)
+            sizes = self.editor_split.sizes()
+            if len(sizes) == 2 and sizes[1] > maxw:
+                total = sum(sizes)
+                self.editor_split.setSizes([max(0, total - maxw), maxw])
 
     def closeEvent(self, event) -> None:
         # 关闭软件前把未落盘的内容全部保存一次
+        self.auto_sync_timer.stop()
         self.autosave_timer.stop()
         self.save_current_book()
         self.flush()
         self.words_timer.stop()
         self._flush_words()
+        if self._snippets_panel is not None:
+            self._snippets_panel.flush_pending()
         # 独立窗口 / 面板里可能还有防抖未触发的改动（时间轴、大纲、设定、
         # 地图、角色关系），逐个 flush，避免强关窗口时丢最后一批编辑。
         for dialog in list(self._timeline_dialogs):

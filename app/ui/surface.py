@@ -871,6 +871,25 @@ class ReadableCard(LiquidCard):
         super().__init__(radius, parent)
         self._readable = True
 
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """风格无关的承载面：玻璃档「底板在下 + 玻璃在上」；其它风格直接铺底板。
+
+        设置大窗是常驻控件，可能在启动时是默认/纸感风格、之后用户才切到玻璃；
+        若卡片类型按构造时的风格定死，切换后 QSS 会让旧 QFrame 变透明、整窗
+        失去底板。这里让底板在任意风格下都自绘，杜绝该路径。
+        """
+        if is_glass():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect())
+        # 外扩 2px 再交给 paint_base_plate：非玻璃档没有外圈玻璃带，底板铺满整卡
+        paint_base_plate(painter, r.adjusted(-BASE_PLATE_INSET, -BASE_PLATE_INSET,
+                                             BASE_PLATE_INSET, BASE_PLATE_INSET),
+                         self._radius + BASE_PLATE_RADIUS_DELTA)
+        painter.end()
+
 
 def attach_backdrop_refresh(widget: QWidget, get_source, msec: int = 135) -> QTimer:
     """给自绘液态表面挂一个防抖失效器：位置 / 尺寸稳定（120–150ms）后重抓背景。

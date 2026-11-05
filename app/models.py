@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass, field, fields, asdict
 
 from app.config import DEFAULT_FONT_FAMILY
+from app.services.secret_store import decrypt_secret, encrypt_secret
 
 
 def new_id() -> str:
@@ -113,6 +114,8 @@ class Settings:
     # 书架
     shelf_view: str = "grid"            # grid / list
     character_view: str = "list"        # 角色页：list 角色列表 / board 关系图
+    snippets_width: int = 320           # 右侧「文笔仿写」片段栏宽度（px，收起时保留）
+    snippets_open: bool = False         # 仿写区展开状态（面板右上角箭头 / Esc 收起后记住）
     ui_style: str = "default"           # 外观风格：default/paper/glass/order（与深浅正交）
     # 玻璃质感三档（ui_style=glass 时生效）：block 立体玻璃块（默认）/ liquid 液态玻璃 / frosted 磨砂雾面
     glass_mode: str = "block"
@@ -127,9 +130,26 @@ class Settings:
     webdav_user: str = ""
     webdav_password: str = ""
     webdav_remote: str = "moji_backup.zip"
+    webdav_dir: str = ""          # 空值回退「催客写作」；最多 3 级
+    sync_covers_mode: str = "thumb"     # 同步封面：none / thumb（256px WebP，默认） / full（旧行为，带原图）
+    auto_sync_enabled: bool = False     # 自动同步开关（默认关闭）
+    auto_sync_interval: int = 30        # 自动同步间隔（分钟）：10 / 20 / 30 / 60
+    auto_sync_last_time: str = ""       # 上次自动同步 HH:MM
+    auto_sync_last_ok: bool = False     # 上次自动同步是否成功
+    auto_sync_signature: str = ""       # 上次成功上传时的本地数据指纹，未变化则不发请求
+
+    # 设置窗口尺寸 / 位置（0 = 未记录，-1 = 未记录坐标；打开时夹在屏幕可用区内）
+    settings_win_w: int = 0
+    settings_win_h: int = 0
+    settings_win_x: int = -1
+    settings_win_y: int = -1
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        # 应用密码用 DPAPI 加密后落盘（键名保持不变，旧配置仍可读）
+        if data.get("webdav_password"):
+            data["webdav_password"] = encrypt_secret(str(data["webdav_password"]))
+        return data
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "Settings":
@@ -193,6 +213,15 @@ class Settings:
         result.para_space_after = max(0.0, min(4.0, float(result.para_space_after)))
         if not result.nickname.strip():
             result.nickname = "写作者"
+        # 应用密码：旧配置是明文（原样保留）；新配置是 dpapi: 前缀密文
+        if result.webdav_password:
+            plain = decrypt_secret(result.webdav_password)
+            if plain:
+                result.webdav_password = plain
+            elif result.webdav_password.startswith("dpapi:"):
+                # 换了系统用户 / 密文损坏：清空并标记，界面提示重新填写，不崩不静默留错
+                result.webdav_password = ""
+                result.webdav_password_lost = True
         return result
 
 

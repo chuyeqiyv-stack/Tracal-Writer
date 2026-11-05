@@ -46,6 +46,26 @@ QToolButton#FloatButton:hover { background: $hover_accent; }
     background: $sidebar_glass;
     border: 1px solid $glass_border;
 }
+/* 写作页右侧「文笔仿写」片段栏：单一底板，不在内部再套第二层框 */
+#SnippetPanel {
+    background: $panel;
+    border: 1px solid $border;
+    border-radius: ${radius_lg}px;
+}
+#SnippetTitle { font-size: 15px; font-weight: 600; color: $text; }
+#SnippetMeta, #SnippetHint { color: $subtext; font-size: 11px; }
+#SnippetHint { font-size: 12px; }
+QPushButton#SnippetAction {
+    background: transparent;
+    border: none;
+    border-radius: ${radius_sm}px;
+    color: $subtext;
+    font-size: 11px;
+    padding: 2px 5px;
+}
+QPushButton#SnippetAction:hover { background: $hover; color: $accent; }
+QPushButton#SnippetAction:pressed { background: $pressed; }
+QSplitter#EditorSplit::handle:horizontal { background: transparent; }
 #BookTitle { font-size: 15px; font-weight: 600; color: $text; }
 #BookMeta, #SidebarFoot, #DrawerHint, #CardSummary, #EditorStatus, #ShelfSubtitle {
     color: $subtext;
@@ -636,7 +656,7 @@ QLabel:disabled { color: $subtext; }
 /* ============================================================
    外观风格结构令牌：标题字体族随风格切换（纸感=衬线，其余=无衬线）
    ============================================================ */
-#DrawerTitle, #NameGenTitle, #ShelfTitle, #MsgTitle, #SectionTitle {
+#DrawerTitle, #SnippetTitle, #NameGenTitle, #ShelfTitle, #MsgTitle, #SectionTitle {
     font-family: $font_title;
 }
 

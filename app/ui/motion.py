@@ -87,6 +87,7 @@ def card_surface(
     spacing: int = 12,
     level: int = 1,
     readable: bool = False,
+    force_readable: bool = False,
 ) -> QVBoxLayout:
     """把 QDialog 变成「透明无边框 + 圆角卡片 + 分层阴影」浮层，返回卡片内布局。
 
@@ -104,8 +105,8 @@ def card_surface(
     # 其它风格保持 QFrame + QSS 实色 / 磨砂噪点
     from app.ui import surface
 
-    if surface.is_glass():
-        card = (surface.ReadableCard(14.0, dialog) if readable
+    if surface.is_glass() or force_readable:
+        card = (surface.ReadableCard(14.0, dialog) if (readable or force_readable)
                 else surface.LiquidCard(14.0, dialog))
     else:
         card = QFrame(dialog)

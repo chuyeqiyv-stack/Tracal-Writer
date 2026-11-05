@@ -56,6 +56,9 @@ MINIMAP_GAP = 12          # 距视口右下角的间距
 MINIMAP_ANIM_MS = 180     # 点击外部跳转的 ease-out 时长
 LABEL_W = 180             # 事件标签块宽度（时间 / 事件名）
 DESC_W = 200              # 描述块宽度
+# 居中文字的对齐标志组合（逐帧逐行重复引用同值对象，不在绘制循环里反复 |
+# 生成新标志：与逐次组合结果等价，只是去掉每帧的临时对象分配）
+TEXT_ALIGN_CENTER = Qt.AlignHCenter | Qt.AlignVCenter
 
 NODE_HINT = "中键拖动移动 · Ctrl+左键拖动调整引线长短"
 LOCKED_HINT = "事件已锁定 · 右键解锁后才能移动"
@@ -498,6 +501,13 @@ class TimelineCanvas(QWidget):
         self._font_time: QFont | None = None
         self._font_title: QFont | None = None
         self._font_desc: QFont | None = None
+        # 配套的 QFontMetrics 与换行结果缓存（同样随字体变化整体失效）：
+        # 文本排版只和「字体 + 文本 + 宽度 + 行数」有关，与缩放 / 滚动无关，
+        # 重复绘制时直接复用，绘制结果与逐帧重新排版完全一致。
+        self._fm_time: QFontMetrics | None = None
+        self._fm_title: QFontMetrics | None = None
+        self._fm_desc: QFontMetrics | None = None
+        self._wrap_cache: dict[tuple[str, str, float, int], list[str]] = {}
 
     def _cached_fonts(self) -> tuple[QFont, QFont, QFont]:
         key = self.font().key()
@@ -506,8 +516,29 @@ class TimelineCanvas(QWidget):
             f_title = QFont(self.font()); f_title.setPixelSize(14); f_title.setBold(True)
             f_desc = QFont(self.font()); f_desc.setPixelSize(11)
             self._font_time, self._font_title, self._font_desc = f_time, f_title, f_desc
+            self._fm_time = QFontMetrics(f_time)
+            self._fm_title = QFontMetrics(f_title)
+            self._fm_desc = QFontMetrics(f_desc)
+            self._wrap_cache.clear()
             self._font_cache_key = key
         return self._font_time, self._font_title, self._font_desc
+
+    def _cached_metrics(self) -> tuple[QFontMetrics, QFontMetrics, QFontMetrics]:
+        """与 _cached_fonts 同一生命周期的三档度量（字体不变就不重建）。"""
+        self._cached_fonts()
+        return self._fm_time, self._fm_title, self._fm_desc
+
+    def _wrap_cached(self, text: str, slot: str, fm: QFontMetrics,
+                     width: float, max_lines: int) -> list[str]:
+        """wrap_lines 的结果缓存；键含档位 / 全文 / 宽度 / 行数，字体变更时清空。"""
+        key = (slot, text, width, max_lines)
+        lines = self._wrap_cache.get(key)
+        if lines is None:
+            lines = wrap_lines(text, fm, width, max_lines)
+            if len(self._wrap_cache) >= 1024:
+                self._wrap_cache.clear()
+            self._wrap_cache[key] = lines
+        return lines
 
     def set_theme(self, theme: dict) -> None:
         self.theme = theme
@@ -706,11 +737,13 @@ class TimelineCanvas(QWidget):
         active_lead = self._drag_node if self._drag_mode == "lead" else None
         moving_node = self._drag_node if self._drag_mode == "node" else None
         font_time, font_title, font_desc = self._cached_fonts()
+        fm_time, fm_title, fm_desc = self._cached_metrics()
+        # 主题文字 / 描述色整帧不变，移出逐事件循环（每帧只建两个 QColor）
+        text_color = QColor(theme["text"])
+        desc_color = QColor(theme["subtext"])
         for e in self.events:
             x = X(self.event_x(e))
             color = self._event_qcolor(e)
-            text_color = QColor(theme["text"])
-            desc_color = QColor(theme["subtext"])
             lead_top = self.lead_top(e)
             lead_bot = self.lead_bot(e)
             top_active = active_lead is e and self._lead_side == "top"
@@ -757,14 +790,14 @@ class TimelineCanvas(QWidget):
                 painter.setPen(QPen(color))
                 # 按实际换行行数算文字块高度（含行距），文字底边固定在引线起点上方，
                 # 多行也完整可见；超过 2 行才省略号收尾
-                fm = QFontMetrics(font)
-                lines = wrap_lines(time_text, fm, LABEL_W, 2)
+                fm = fm_time
+                lines = self._wrap_cached(time_text, "time", fm, LABEL_W, 2)
                 line_h = fm.height()
                 top = stem_top - 6 - line_h * len(lines)
                 for i, ln in enumerate(lines):
                     painter.drawText(
                         QRectF(x - LABEL_W / 2, top + i * line_h, LABEL_W, line_h),
-                        Qt.AlignHCenter | Qt.AlignVCenter, ln,
+                        TEXT_ALIGN_CENTER, ln,
                     )
 
             # 下茎 + 事件名（文字块从引线末端向下排；多行按实际高度，不被固定 rect 裁掉）
@@ -772,14 +805,14 @@ class TimelineCanvas(QWidget):
             title = str(e.get("event") or "未命名事件")
             painter.setFont(title_font)
             painter.setPen(QPen(text_color))
-            fm_t = QFontMetrics(title_font)
-            t_lines = wrap_lines(title, fm_t, LABEL_W, 2)
+            fm_t = fm_title
+            t_lines = self._wrap_cached(title, "title", fm_t, LABEL_W, 2)
             t_line_h = fm_t.height()
             t_top = mid_y + lead_bot
             for i, ln in enumerate(t_lines):
                 painter.drawText(
                     QRectF(x - LABEL_W / 2, t_top + i * t_line_h, LABEL_W, t_line_h),
-                    Qt.AlignHCenter | Qt.AlignVCenter, ln,
+                    TEXT_ALIGN_CENTER, ln,
                 )
             painter.setPen(QPen(color, 2.0 if bot_active else 1.4,
                                 Qt.SolidLine if bot_active else Qt.DashLine))
@@ -795,14 +828,14 @@ class TimelineCanvas(QWidget):
                 font_d = font_desc
                 painter.setFont(font_d)
                 painter.setPen(QPen(desc_color))
-                fm_d = QFontMetrics(font_d)
-                d_lines = wrap_lines(desc, fm_d, DESC_W, 3)
+                fm_d = fm_desc
+                d_lines = self._wrap_cached(desc, "desc", fm_d, DESC_W, 3)
                 d_line_h = fm_d.height()
                 d_top = t_top + t_line_h * len(t_lines) + 6
                 for i, ln in enumerate(d_lines):
                     painter.drawText(
                         QRectF(x - DESC_W / 2, d_top + i * d_line_h, DESC_W, d_line_h),
-                        Qt.AlignHCenter | Qt.AlignVCenter, ln,
+                        TEXT_ALIGN_CENTER, ln,
                     )
 
             # 锁定徽标最后画，压在最上层；与选中环各占一侧，可同时表达

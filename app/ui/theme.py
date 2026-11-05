@@ -601,7 +601,8 @@ def _surface_qss(theme: dict, kind: str) -> str:
             "#Sidebar { border-top: 1px solid $liq_top;"
             " border-bottom: 1px solid $liq_bottom; }\n"
             "#TopBar { border-bottom: 1px solid $liq_bottom; }\n"
-            "#Drawer, QFrame#MessageBox { background: transparent; border: none; }\n"
+            "#Drawer, QFrame#MessageBox, #SnippetPanel {"
+            " background: transparent; border: none; }\n"
             "\n/* 原生弹出层（菜单 / 下拉 / tooltip）不是自绘玻璃面，改为实底+描边，"
             "避免文字被下面正文透上来；外层玻璃由父窗口保持 */\n"
             f"QMenu, QToolTip, QComboBox QAbstractItemView, QFontComboBox QAbstractItemView {{"
@@ -618,7 +619,7 @@ def _surface_qss(theme: dict, kind: str) -> str:
         url = QUrl.fromLocalFile(str(noise)).toString()
         return (
             "\n/* ---- 磨砂哑光：预生成极淡噪点平铺（无高光、无反光）---- */\n"
-            f"#Sidebar, #TopBar, #Drawer, QFrame#MessageBox {{"
+            f"#Sidebar, #TopBar, #Drawer, QFrame#MessageBox, #SnippetPanel {{"
             f" background-image: url({url}); background-repeat: repeat; }}\n"
         )
     return ""

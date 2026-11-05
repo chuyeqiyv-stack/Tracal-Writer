@@ -13,7 +13,7 @@ from pathlib import Path
 
 APP_NAME = "催客写作"
 APP_NAME_EN = "Trecal"   # 英文品牌展示名
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 ORG_NAME = "MojiWriter"  # 数据目录沿用旧名，避免升级后找不到已有数据
 
 # 默认正文字体（Windows 下若缺失会自动回退）

@@ -10,16 +10,21 @@
 """
 from __future__ import annotations
 
+import math
 import os
+import time
+from collections import OrderedDict
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontMetricsF,
     QImage,
     QKeySequence,
     QPainter,
     QPainterPath,
+    QPainterPathStroker,
     QPen,
     QPixmap,
     QPolygonF,
@@ -36,7 +41,6 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsPolygonItem,
     QGraphicsScene,
-    QGraphicsSimpleTextItem,
     QGraphicsView,
     QHBoxLayout,
     QLabel,
@@ -100,6 +104,31 @@ TERRAIN_TYPES: list[tuple[str, str, str]] = [
 ]
 TERRAIN_TYPE_MAP = {key: (label, color) for key, label, color in TERRAIN_TYPES}
 
+# 势力框文字：按框的「屏幕尺寸」自动铺满（文本框语义），最多 2 行。
+# aw/ah 为文字可用区（留内边距，不贴边、不压边框）；字号在屏幕空间算出后换算回场景。
+FACTION_LABEL_MIN_PX = 10           # 旧常量保留（其它模块/脚本仍引用）
+FACTION_LABEL_MAX_PX = 28           # 旧常量保留
+FACTION_LABEL_RATIO = 0.052         # 旧常量保留
+FACTION_LABEL_PAD_RATIO = 0.04      # 旧常量保留
+FACTION_LABEL_SCREEN_MIN_PX = 12.0  # 屏幕下限
+FACTION_LABEL_OVERFLOW_RATIO = 0.92  # 文字可用宽 = 框屏幕宽 × 0.92
+FACTION_LABEL_DOWNGRADE_STEPS = 2    # 旧常量保留
+FACTION_LABEL_MIN_SCREEN_PX = 12.0   # 屏幕字号下限（可调）
+FACTION_LABEL_MAX_SCREEN_PX = 40.0   # 屏幕字号上限，避免极小名字出现夸张大字
+FACTION_LABEL_TEXT_W_RATIO = 0.92    # 文字可用宽比例
+FACTION_LABEL_TEXT_H_RATIO = 0.88    # 文字可用高比例
+FACTION_LABEL_LINE_FACTOR = 1.15     # 行距 = 1.15 × 字号
+LABEL_BITMAP_MAX_ITEMS = 32          # 文字位图缓存：普通 LRU，最多 32 张
+LABEL_BITMAP_MAX_BYTES = 4 * 1024 * 1024   # 硬上限 4MB
+LABEL_PREWARM_BUDGET_MS = 5.0        # 首次开图预生成预算
+LABEL_ZOOM_IDLE_MS = 140             # 缩放停手多久后补新字号档
+
+# 地形路径：连续点击的时间窗、拖拽落点的最小间距、端点半径
+TERRAIN_CONTINUE_MS = 3000
+TERRAIN_MIN_STEP = 12.0
+TERRAIN_NODE_R = 5.5
+TERRAIN_UNDO_MAX = 40
+
 
 def terrain_label(key: str) -> str:
     return TERRAIN_TYPE_MAP.get(str(key or ""), ("地形", ""))[0]
@@ -111,7 +140,7 @@ def terrain_color(key: str) -> str:
 
 
 def draw_terrain_glyph(painter: QPainter, kind: str, color: str, size: float = 30.0) -> None:
-    """在 (0,0) 附近按地形类型画矢量小图标（图例与画布共用同一画法）。"""
+    """在 (0,0) 附近按地形类型画矢量小图标（类型选择器与画布共用同一画法）。"""
     c = QColor(color)
     painter.save()
     pen = QPen(c.darker(112), max(1.4, size * 0.07))
@@ -200,78 +229,508 @@ def terrain_pixmap(kind: str, color: str, size: int = 22) -> QPixmap:
 
 
 # ======================================================================
-# 场景元素：地形标注
+# 场景元素：地形标注（路径式）
 # ======================================================================
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _path_length(points: list[QPointF]) -> float:
+    total = 0.0
+    for i in range(len(points) - 1):
+        delta = points[i + 1] - points[i]
+        total += (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+    return total
+
+
+def _point_at(points: list[QPointF], distance: float) -> tuple[QPointF, QPointF]:
+    """按弧长取点，同时返回该处单位法线。"""
+    for i in range(len(points) - 1):
+        seg = points[i + 1] - points[i]
+        length = (seg.x() ** 2 + seg.y() ** 2) ** 0.5
+        if length <= 1e-6:
+            continue
+        if distance <= length or i == len(points) - 2:
+            ratio = max(0.0, min(1.0, distance / length))
+            point = points[i] + seg * ratio
+            normal = QPointF(-seg.y() / length, seg.x() / length)
+            return point, normal
+        distance -= length
+    return points[-1], QPointF(0.0, -1.0)
+
+
+def _smooth_path(points: list[QPointF], closed: bool = False) -> QPainterPath:
+    """Catmull-Rom → 三次贝塞尔，做河流 / 湖泊的平滑轮廓。"""
+    pts = list(points)
+    if closed and len(pts) >= 3:
+        pts = pts + [pts[0], pts[1]]
+    path = QPainterPath(pts[0])
+    for i in range(len(pts) - 1):
+        p0 = pts[i - 1] if i > 0 else pts[i]
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        p3 = pts[i + 2] if i + 2 < len(pts) else p2
+        c1 = p1 + (p2 - p0) / 6.0
+        c2 = p2 - (p3 - p1) / 6.0
+        path.cubicTo(c1, c2, p2)
+    return path
+
+
+class TerrainNodeItem(QGraphicsEllipseItem):
+    """地形路径端点：hover 显示，可拖动；拖动后回写父项点列。"""
+
+    def __init__(self, index: int, owner: "TerrainItem") -> None:
+        super().__init__(-TERRAIN_NODE_R, -TERRAIN_NODE_R,
+                         TERRAIN_NODE_R * 2, TERRAIN_NODE_R * 2, owner)
+        self.index = index
+        self.owner = owner
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setBrush(QColor(owner.canvas.theme.get("accent") or "#7C5CE6"))
+        pen = QPen(QColor(255, 255, 255, 230), 1.2)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setZValue(3)
+        self.setVisible(False)
+
+    def itemChange(self, change, value):  # noqa: N802
+        if (change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged
+                and not self.owner._syncing_nodes):
+            self.owner.on_node_moved(self.index, self.pos())
+        return super().itemChange(change, value)
+
+    def hoverEnterEvent(self, event):  # noqa: N802
+        self.owner._node_hover = True
+        self.owner.set_handles_visible(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):  # noqa: N802
+        self.owner._node_hover = False
+        self.owner.canvas.schedule_handles_hide(self.owner)
+        super().hoverLeaveEvent(event)
+
+
 class TerrainItem(QGraphicsItem):
-    """地形标记：类型矢量图标 + 名称，可拖动 / 改类型颜色 / 置顶，针尖即保存坐标。"""
+    """地形标注：一串归一化点列组成的路径（山脉 / 河流 / 森林 / 湖泊 / 沙漠 / 平原）。
+
+    画布内点坐标为场景坐标；落盘时由画布统一转成相对底图的归一化坐标。
+    单点路径仍按旧版矢量图标绘制，兼容迁移过来的旧标注。
+    """
 
     SIZE = 34.0
 
     def __init__(self, tid: str, kind: str, name: str, note: str,
-                 color: str, top: bool, canvas: "MapCanvas") -> None:
+                 color: str, top: bool, points, canvas: "MapCanvas") -> None:
         super().__init__()
         self.tid = tid
         self.kind = kind if kind in TERRAIN_TYPE_MAP else "mountain"
-        self.name = name
+        self.name = name or terrain_label(self.kind)
         self.note = note
         self.color = color or terrain_color(self.kind)
         self.top = bool(top)
         self.canvas = canvas
+        self.points: list[QPointF] = [
+            QPointF(float(p.x()), float(p.y())) for p in points
+        ] or [QPointF(0.0, 0.0)]
+        self._nodes: list[TerrainNodeItem] = []
+        self._syncing_nodes = False
+        self._node_hover = False
+        self._hovered = False
 
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
         self.setZValue(20 if self.top else 5)
-        self.setToolTip(f"{self.name}（{terrain_label(self.kind)}）\n{self.note}" if self.note
-                        else f"{self.name}（{terrain_label(self.kind)}）")
+        self._refresh_tooltip()
+        self._rebuild_nodes()
 
+    # ------------------------------------------------------------------
+    def _refresh_tooltip(self) -> None:
+        self.setToolTip(
+            f"{self.name}（{terrain_label(self.kind)}）\n{self.note}" if self.note
+            else f"{self.name}（{terrain_label(self.kind)}）"
+        )
+
+    def _rebuild_nodes(self) -> None:
+        for node in self._nodes:
+            if node.scene() is not None:
+                node.scene().removeItem(node)
+        self._nodes = [TerrainNodeItem(i, self) for i in range(len(self.points))]
+        self._sync_nodes()
+
+    def _sync_nodes(self) -> None:
+        self._syncing_nodes = True
+        for i, node in enumerate(self._nodes):
+            if i < len(self.points):
+                node.setPos(self.points[i])
+        self._syncing_nodes = False
+
+    def on_node_moved(self, index: int, pos: QPointF) -> None:
+        if 0 <= index < len(self.points):
+            self.prepareGeometryChange()
+            self.points[index] = QPointF(pos)
+            self.update()
+            self.canvas.on_item_moved()
+
+    def add_point(self, pos: QPointF) -> int:
+        self.prepareGeometryChange()
+        self.points.append(QPointF(pos))
+        self._rebuild_nodes()
+        self.update()
+        return len(self.points) - 1
+
+    def remove_point(self, index: int) -> bool:
+        if len(self.points) <= 1 or not (0 <= index < len(self.points)):
+            return False
+        self.prepareGeometryChange()
+        del self.points[index]
+        self._rebuild_nodes()
+        self.update()
+        return True
+
+    def remove_last_point(self) -> bool:
+        return self.remove_point(len(self.points) - 1)
+
+    def scene_points(self) -> list[QPointF]:
+        return [QPointF(p) for p in self.points]
+
+    def set_handles_visible(self, visible: bool) -> None:
+        for node in self._nodes:
+            node.setVisible(bool(visible))
+
+    def _band_width(self) -> float:
+        length = _path_length(self.points)
+        return _clamp(length * 0.012, 3.0, 10.0)
+
+    # ------------------------------------------------------------------
     def boundingRect(self) -> QRectF:  # noqa: N802
-        return QRectF(-self.SIZE, -self.SIZE / 2 - 20, self.SIZE * 2, self.SIZE + 34)
+        if len(self.points) == 1:
+            p = self.points[0]
+            return QRectF(p.x() - self.SIZE, p.y() - self.SIZE / 2 - 22,
+                          self.SIZE * 2, self.SIZE + 44)
+        rect = QRectF(self.points[0], QSize(0, 0))
+        for p in self.points[1:]:
+            rect = rect.united(QRectF(p, QSize(0, 0)))
+        margin = _clamp(_path_length(self.points) * 0.08, 30.0, 80.0)
+        return rect.adjusted(-margin, -margin - 20, margin, margin + 20)
+
+    def shape(self) -> QPainterPath:  # noqa: N802
+        path = QPainterPath()
+        if len(self.points) == 1:
+            path.addEllipse(self.points[0], 20.0, 20.0)
+            return path
+        line = QPainterPath(self.points[0])
+        for p in self.points[1:]:
+            line.lineTo(p)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(max(16.0, self._band_width() * 2.2))
+        path = stroker.createStroke(line)
+        for p in self.points:
+            path.addEllipse(p, TERRAIN_NODE_R + 2, TERRAIN_NODE_R + 2)
+        return path
 
     def paint(self, painter, option, widget=None):  # noqa: N802
         painter.setRenderHint(QPainter.Antialiasing, True)
         if self.isSelected():
-            ring = QPen(QColor("#7C5CE6"), 2.2)
-            ring.setCosmetic(True)
-            painter.setPen(ring)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(QPointF(0, 0), self.SIZE / 2 + 3, self.SIZE / 2 + 3)
-        painter.translate(0, 2)
-        draw_terrain_glyph(painter, self.kind, self.color, self.SIZE)
-        if self.name:
-            font = QFont(painter.font())
-            font.setPixelSize(12)
-            font.setBold(True)
-            painter.setFont(font)
-            text_rect = QRectF(-80, -self.SIZE / 2 - 20, 160, 16)
-            painter.setPen(QPen(QColor(0, 0, 0, 100), 2.6))
-            painter.drawText(
-                text_rect,
-                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                self.name,
-            )
-            painter.setPen(QPen(QColor("#1F2329")))
-            painter.drawText(
-                text_rect,
-                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                self.name,
-            )
+            line = QPainterPath(self.points[0])
+            for p in self.points[1:]:
+                line.lineTo(p)
+            pen = QPen(QColor("#7C5CE6"), 2.2, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            if len(self.points) > 1:
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(line)
+            else:
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(self.points[0], self.SIZE / 2 + 3, self.SIZE / 2 + 3)
+        if len(self.points) == 1:
+            self._paint_single(painter)
+        else:
+            self._paint_path(painter)
+        self._paint_name(painter)
 
+    def _paint_single(self, painter: QPainter) -> None:
+        painter.save()
+        painter.translate(self.points[0].x(), self.points[0].y() + 2)
+        draw_terrain_glyph(painter, self.kind, self.color, self.SIZE)
+        painter.restore()
+
+    def _paint_name(self, painter: QPainter) -> None:
+        if not self.name:
+            return
+        if len(self.points) == 1:
+            p = self.points[0]
+            anchor = QPointF(p.x(), p.y() - self.SIZE / 2 - 12)
+        else:
+            mid, normal = _point_at(self.points, _path_length(self.points) / 2.0)
+            offset = self._band_width() + 16.0
+            anchor = mid + normal * offset
+        font = QFont(painter.font())
+        font.setPixelSize(12)
+        font.setBold(True)
+        painter.setFont(font)
+        rect = QRectF(anchor.x() - 80, anchor.y() - 8, 160, 16)
+        pen = QPen(QColor(0, 0, 0, 100), 2.6)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                         self.name)
+        painter.setPen(QPen(QColor(str(self.canvas.theme.get("text") or "#1F2329"))))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                         self.name)
+
+    # ------------------------------------------------------------------
+    def _paint_path(self, painter: QPainter) -> None:
+        if self.kind == "mountain":
+            self._paint_ridge(painter)
+        elif self.kind == "river":
+            self._paint_river(painter)
+        elif self.kind == "forest":
+            self._paint_forest(painter)
+        elif self.kind in ("lake", "plain"):
+            self._paint_area(painter, self.kind == "lake")
+        elif self.kind == "desert":
+            self._paint_desert(painter)
+        else:
+            self._paint_glyphs(painter)
+
+    def _paint_glyphs(self, painter: QPainter) -> None:
+        for p in self.points:
+            painter.save()
+            painter.translate(p.x(), p.y() + 2)
+            draw_terrain_glyph(painter, self.kind, self.color, self.SIZE * 0.8)
+            painter.restore()
+
+    def _paint_ridge(self, painter: QPainter) -> None:
+        """山脉：沿路径的锯齿脊线，脊高按总长自适应并夹取范围。"""
+        length = _path_length(self.points)
+        height = _clamp(length * 0.06, 9.0, 34.0)
+        tooth = _clamp(height * 1.5, 16.0, 46.0)
+        count = max(2, int(length / tooth))
+        fill = QColor(self.color)
+        fill.setAlpha(86)
+        edge = QPen(QColor(self.color).darker(118), 1.6)
+        edge.setCosmetic(True)
+        painter.setPen(edge)
+        painter.setBrush(fill)
+        for i in range(count):
+            start = i * tooth
+            end = min(length, start + tooth)
+            if end <= start:
+                continue
+            middle = (start + end) / 2.0
+            p0, _n0 = _point_at(self.points, start)
+            p1, _n1 = _point_at(self.points, end)
+            peak, normal = _point_at(self.points, middle)
+            peak = peak + normal * height
+            path = QPainterPath(p0)
+            path.lineTo(peak)
+            path.lineTo(p1)
+            path.closeSubpath()
+            painter.drawPath(path)
+        # 脊底：一条随路径的细线，避免锯齿悬空
+        pen = QPen(QColor(self.color).darker(130), 1.4)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath(self.points[0])
+        for p in self.points[1:]:
+            path.lineTo(p)
+        painter.drawPath(path)
+
+    def _paint_river(self, painter: QPainter) -> None:
+        """河流：平滑曲线带轻微宽度。"""
+        width = self._band_width()
+        path = _smooth_path(self.points)
+        outer = QPen(QColor(self.color).darker(125), width + 2.2)
+        outer.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(outer)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+        inner = QPen(QColor(self.color), width)
+        inner.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(inner)
+        painter.drawPath(path)
+        core = QPen(QColor(self.color).lighter(122), max(1.6, width * 0.42))
+        core.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(core)
+        painter.drawPath(path)
+
+    def _paint_forest(self, painter: QPainter) -> None:
+        """森林：沿线的树簇带。"""
+        length = _path_length(self.points)
+        step = 16.0
+        size = _clamp(length * 0.02, 9.0, 17.0)
+        fill = QColor(self.color)
+        fill.setAlpha(150)
+        outline = QPen(QColor(self.color).darker(125), 1.1)
+        outline.setCosmetic(True)
+        painter.setPen(outline)
+        painter.setBrush(fill)
+        distance = step / 2.0
+        flip = 1
+        while distance < length:
+            p, normal = _point_at(self.points, distance)
+            base = p + normal * (size * 0.45 * flip)
+            painter.drawPolygon([
+                base + QPointF(0, -size * 0.9),
+                base + QPointF(-size * 0.42, size * 0.25),
+                base + QPointF(size * 0.42, size * 0.25),
+            ])
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawLine(base + QPointF(0, size * 0.25),
+                             base + QPointF(0, size * 0.62))
+            painter.setBrush(fill)
+            distance += step
+            flip *= -1
+
+    def _paint_area(self, painter: QPainter, lake: bool) -> None:
+        """湖泊（闭合轮廓）/ 平原（浅色区域）。"""
+        if len(self.points) < 3:
+            p, normal = _point_at(self.points, 0.0)
+            painter.setBrush(QColor(self.color))
+            painter.setPen(QPen(QColor(self.color).darker(120), 1.4))
+            painter.drawEllipse(p, 26.0, 18.0)
+            return
+        path = _smooth_path(self.points, closed=True)
+        fill = QColor(self.color)
+        fill.setAlpha(96 if lake else 58)
+        painter.setBrush(fill)
+        painter.setPen(QPen(QColor(self.color).darker(122), 1.8))
+        painter.drawPath(path)
+        if not lake:
+            # 平原：内部点几笔浅草线，避免像一块死色
+            pen = QPen(QColor(self.color).darker(108), 1.2)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            for i in range(1, len(self.points) - 1):
+                p = self.points[i]
+                painter.drawLine(p + QPointF(-7, 4), p + QPointF(-3, -3))
+                painter.drawLine(p + QPointF(6, 4), p + QPointF(2, -3))
+
+    def _paint_desert(self, painter: QPainter) -> None:
+        """沙漠：沿线波纹带。"""
+        length = _path_length(self.points)
+        width = _clamp(length * 0.02, 10.0, 26.0)
+        base = QColor(self.color)
+        base.setAlpha(44)
+        band = QPen(base, width)
+        band.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(band)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(_smooth_path(self.points))
+        pen = QPen(QColor(self.color).darker(112), 1.6)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        for offset in (width * 0.32, -width * 0.32):
+            wave = QPainterPath()
+            first = True
+            distance = 0.0
+            while distance <= length:
+                p, normal = _point_at(self.points, distance)
+                amp = 4.2 * (1 if int(distance) % 2 == 0 else -1)
+                point = p + normal * (offset + amp * 0.25) + QPointF(0, -amp)
+                if first:
+                    wave.moveTo(point)
+                    first = False
+                else:
+                    wave.lineTo(point)
+                distance += 14.0
+            painter.drawPath(wave)
+
+    # ------------------------------------------------------------------
     def itemChange(self, change, value):  # noqa: N802
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            self.canvas.on_item_moved()
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            selected = bool(value)
+            self.set_handles_visible(selected)
+            if not selected:
+                self.canvas.schedule_handles_hide(self)
         return super().itemChange(change, value)
+
+    def hoverEnterEvent(self, event):  # noqa: N802
+        self._hovered = True
+        self.set_handles_visible(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):  # noqa: N802
+        self._hovered = False
+        self.canvas.schedule_handles_hide(self)
+        super().hoverLeaveEvent(event)
 
     def set_top(self, top: bool) -> None:
         self.top = bool(top)
         self.setZValue(20 if self.top else 5)
 
 
-
-
 # ======================================================================
 # 场景元素：势力多边形
 # ======================================================================
+class LabelBitmapCache:
+    """势力名文字位图缓存（普通 LRU，32 张 / 4MB 双硬闸）。
+
+    生命周期跟随地图页：切到写作页时地图窗只是隐藏，缓存保留；
+    只有地图页销毁或程序退出才整体释放。释放时只清位图，不碰视图状态。
+    """
+
+    def __init__(self, max_items: int = LABEL_BITMAP_MAX_ITEMS,
+                 max_bytes: int = LABEL_BITMAP_MAX_BYTES) -> None:
+        self.max_items = max_items
+        self.max_bytes = max_bytes
+        self._items: "OrderedDict[tuple, tuple[QPixmap, float]]" = OrderedDict()
+        self.bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.stale_hits = 0
+
+    @staticmethod
+    def _size_of(pm: QPixmap) -> int:
+        return int(pm.width()) * int(pm.height()) * 4
+
+    def get(self, key: tuple):
+        entry = self._items.pop(key, None)
+        if entry is None:
+            self.misses += 1
+            return None
+        self._items[key] = entry
+        self.hits += 1
+        return entry
+
+    def put(self, key: tuple, pm: QPixmap, scale: float) -> None:
+        old = self._items.pop(key, None)
+        if old is not None:
+            self.bytes -= self._size_of(old[0])
+        self._items[key] = (pm, scale)
+        self.bytes += self._size_of(pm)
+        while (len(self._items) > self.max_items
+               or self.bytes > self.max_bytes) and self._items:
+            _, value = self._items.popitem(last=False)
+            self.bytes -= self._size_of(value[0])
+        if self.bytes < 0:
+            self.bytes = 0
+
+    def stale_for(self, name: str, lines: tuple, color: str):
+        """缩放中缺当前字号档时，拿同名旧档暂顶（最近使用优先）。"""
+        for key in reversed(self._items):
+            if key[0] == name and key[2] == lines and key[3] == color:
+                self.stale_hits += 1
+                return self._items[key]
+        return None
+
+    def clear(self) -> None:
+        self._items.clear()
+        self.bytes = 0
+        self.hits = self.misses = self.stale_hits = 0
+
+    def stats(self) -> dict:
+        return {"items": len(self._items), "bytes": self.bytes,
+                "hits": self.hits, "misses": self.misses,
+                "stale_hits": self.stale_hits}
+
+
 class FactionItem(QGraphicsPolygonItem):
     """势力范围多边形：半透明填充 + 同色描边 + 中心势力名。"""
 
@@ -286,13 +745,16 @@ class FactionItem(QGraphicsPolygonItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
         self.setZValue(0)
+        self.setToolTip(name)   # 框内容不下时看完整名字
 
         fill = QColor(color)
         fill.setAlpha(78)
         self.setBrush(fill)
 
-        self._label = QGraphicsSimpleTextItem(self)
-        self._update_label()
+        self._label_key = None
+        self._label_cache = (QFont(), [], QRectF(), 6.0)
+        self._label_color_key = None
+        self._label_color_val = None
         self._apply_pen()
 
     # ------------------------------------------------------------------
@@ -302,25 +764,126 @@ class FactionItem(QGraphicsPolygonItem):
         self.setPen(pen)
 
     def _update_label(self) -> None:
+        """字号 / 内边距按框的较短边换算；超长名称按框宽换行、末行省略。"""
+        self._label_key = None
+        self._label_color_key = None
+        self.update()
+
+    def _label_text_color(self) -> QColor:
+        """按「半透明填充叠在地图底色上」的实际明度选黑/白字，保证两套主题都清晰。"""
+        window = QColor(str(self.canvas.theme.get("window") or "#FFFFFF"))
+        key = (self.color, window.name())
+        if key == self._label_color_key and self._label_color_val is not None:
+            return self._label_color_val
+        fill = QColor(self.color)
+        fill.setAlpha(78)          # 与势力框填充透明度保持一致
+        a = fill.alphaF()
+        mixed = QColor(
+            int(fill.red() * a + window.red() * (1 - a)),
+            int(fill.green() * a + window.green() * (1 - a)),
+            int(fill.blue() * a + window.blue() * (1 - a)),
+        )
+        color = _text_color_for(mixed)
+        self._label_color_key = key
+        self._label_color_val = color
+        return color
+
+    def label_font_px(self) -> int:
+        return self._label_metrics()[0].pixelSize()
+
+    def _label_metrics(self) -> tuple[QFont, list[str], QRectF, float]:
+        """按框的屏幕尺寸自动铺满：先在屏幕空间算字号/行数，再换算回场景。"""
         poly = self.polygon()
-        count = max(1, len(poly))
-        cx = sum(p.x() for p in poly) / count
-        cy = sum(p.y() for p in poly) / count
+        if poly.isEmpty():
+            return QFont(), [], QRectF(), 6.0
+        rect = poly.boundingRect()
+        scene_w, scene_h = abs(rect.width()), abs(rect.height())
+        zoom_raw = max(0.01, float(getattr(self.canvas, "_zoom", 1.0) or 1.0))
+        zoom_eff = zoom_raw if zoom_raw <= 1.0 else 1.0   # 缩放 >1 不再额外缩小
+        bw, bh = scene_w * zoom_raw, scene_h * zoom_raw   # 框的屏幕逻辑像素
+        pad_screen = max(6.0, min(bw, bh) * 0.06)
+        # 可用区同时受比例与内边距约束，避免字号按 0.92 算出来却压到边框
+        aw = max(1.0, min(bw * FACTION_LABEL_TEXT_W_RATIO, bw - pad_screen * 2))
+        ah = max(1.0, min(bh * FACTION_LABEL_TEXT_H_RATIO, bh - pad_screen * 2))
+        n_chars = max(1, len(self.name))
+
+        # 枚举 1/2 行，取屏幕字号最大的方案（纯算术，不触发排版测量）
+        best_n, best_fs = 1, 0.0
+        for n in (1, 2):
+            per_line = max(1, math.ceil(n_chars / n))
+            fs_w = aw / per_line
+            fs_h = ah / (n * FACTION_LABEL_LINE_FACTOR)
+            fs = min(fs_w, fs_h)
+            if fs > best_fs:
+                best_fs, best_n = fs, n
+
+        room = min(aw / 2.0, ah)          # 屏幕下限不得突破可显示空间
+        fs_screen = min(best_fs, FACTION_LABEL_MAX_SCREEN_PX)
+        floor_px = min(FACTION_LABEL_MIN_SCREEN_PX, room)
+        fs_screen = max(min(fs_screen, room), min(floor_px, room))
+        fs_screen = max(1.0, min(fs_screen, room))
+        fs_scene = fs_screen / zoom_eff
+
+        key = (self.name, int(round(bw)), int(round(bh)),
+               best_n, int(round(zoom_raw * 100)))
+        if key == self._label_key:
+            return self._label_cache
+
+        pad = pad_screen / zoom_raw
         font = QFont()
-        font.setPixelSize(14)
         font.setBold(True)
-        self._label.setFont(font)
-        self._label.setText(self.name)
-        self._label.setBrush(_text_color_for(QColor(self.color)))
-        outline = QPen(QColor(0, 0, 0, 90), 2.4)
-        outline.setCosmetic(True)
-        self._label.setPen(outline)
-        rect = self._label.boundingRect()
-        self._label.setPos(cx - rect.width() / 2, cy - rect.height() / 2)
+        font.setPixelSize(max(1, int(round(fs_scene))))
+        fm = QFontMetricsF(font)
+        text_w = max(1.0, scene_w - pad * 2)
+        text_h = max(1.0, scene_h - pad * 2)
+
+        lines = self._split_name(self.name, best_n)
+        # 垂直兜底：Qt 实际行距略大于 1.15em 时逐像素收字号，避免压到边框
+        while (fm.lineSpacing() * len(lines) > text_h
+               and font.pixelSize() > 1):
+            font.setPixelSize(font.pixelSize() - 1)
+            fm = QFontMetricsF(font)
+
+        # 水平兜底：屏幕下限仍放不下（窄条 + 长名）→ 前 1–2 字 + …，全名交给 tooltip
+        if (fs_screen < FACTION_LABEL_MIN_SCREEN_PX
+                or any(fm.horizontalAdvance(line) > text_w for line in lines)):
+            lines = self._abbreviate(lines, fm, text_w)
+
+        self._label_key = key
+        self._label_cache = (font, lines, rect, pad)
+        return self._label_cache
+
+    @staticmethod
+    def _abbreviate(lines: list[str], fm: QFontMetricsF, max_w: float) -> list[str]:
+        joined = "".join(lines)
+        for count in (2, 1):
+            if len(joined) <= count:
+                break
+            candidate = joined[:count] + "…"
+            if fm.horizontalAdvance(candidate) <= max_w:
+                return [candidate]
+        return [joined[:1]]
+
+    @staticmethod
+    def _split_name(text: str, n: int) -> list[str]:
+        """按字数均分成 1–2 行；优先在空格/标点后断行，避免孤字成行。"""
+        if n <= 1 or len(text) <= 2:
+            return [text]
+        mid = max(1, math.ceil(len(text) / n))
+        for delta in (0, -1, 1):
+            idx = mid + delta
+            if 0 < idx < len(text) and text[idx - 1].isspace():
+                return [text[:idx].strip(), text[idx:].strip()]
+        while mid > 1 and text[mid] in "，。、！？：；）」』…":
+            mid -= 1
+        if len(text) - mid == 1:
+            mid -= 1
+        return [text[:mid], text[mid:]]
 
     def set_style(self, name: str, color: str) -> None:
         self.name = name
         self.color = color
+        self.setToolTip(name)
         fill = QColor(color)
         fill.setAlpha(78)
         self.setBrush(fill)
@@ -339,9 +902,86 @@ class FactionItem(QGraphicsPolygonItem):
             self._apply_pen()
         return super().itemChange(change, value)
 
+    def _render_label_bitmap(self, font: QFont, lines: list[str], scale: float,
+                             color: QColor, dpr: float) -> QPixmap:
+        """把文字渲成位图（按 DPR 生成）：绘制时贴图，避免每帧重新栅格化。"""
+        fm = QFontMetricsF(font)
+        max_adv = max((fm.horizontalAdvance(text) for text in lines), default=0.0)
+        line_h = fm.lineSpacing()
+        bleed = 3.0 * max(1.0, dpr)          # 屏幕像素外扩，容纳描边
+        width_px = max(1, int(math.ceil(max_adv * scale)) + int(bleed * 2) + 2)
+        height_px = max(1, int(math.ceil(line_h * len(lines) * scale))
+                        + int(bleed * 2) + 2)
+        pm = QPixmap(width_px, height_px)
+        pm.fill(Qt.GlobalColor.transparent)
+        pix = QPainter(pm)
+        pix.setRenderHint(QPainter.Antialiasing, True)
+        pf = QFont(font)
+        pf.setPixelSize(max(1, int(round(font.pixelSize() * scale))))
+        pix.setFont(pf)
+        pfm = QFontMetricsF(pf)
+        outline = QPen(QColor(0, 0, 0, 100), max(1.0, 2.6 * max(1.0, dpr)))
+        outline.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        y = float(bleed)
+        for text in lines:
+            line_rect = QRectF(bleed, y, width_px - bleed * 2, pfm.lineSpacing())
+            pix.setPen(outline)
+            pix.drawText(line_rect, Qt.AlignmentFlag.AlignHCenter
+                         | Qt.AlignmentFlag.AlignVCenter, text)
+            pix.setPen(QPen(color))
+            pix.drawText(line_rect, Qt.AlignmentFlag.AlignHCenter
+                         | Qt.AlignmentFlag.AlignVCenter, text)
+            y += pfm.lineSpacing()
+        pix.end()
+        return pm
+
+    def _label_bitmap(self, metrics=None, text_color: QColor | None = None):
+        """取当前字号档的文字位图（LRU 命中 / 缩放旧图暂顶 / 现场生成）。"""
+        font, lines, rect, pad = metrics or self._label_metrics()
+        if not lines:
+            return QPixmap(), 1.0
+        zoom_raw = max(0.01, float(getattr(self.canvas, "_zoom", 1.0) or 1.0))
+        try:
+            dpr = max(1.0, float(self.canvas.devicePixelRatioF()))
+        except Exception:
+            dpr = 1.0
+        bucket = int(round(zoom_raw * 100)) / 100.0
+        scale = max(bucket * dpr, 0.01)
+        text_color = text_color or self._label_text_color()
+        cache: LabelBitmapCache = self.canvas._label_bitmaps
+        key = (self.name, font.pixelSize(), tuple(lines),
+               text_color.name(), int(round(bucket * 100)))
+        entry = cache.get(key)
+        if entry is None and self.canvas._label_zoom_timer.isActive():
+            # 缩放进行中：旧字号档的图先顶着，不逐帧重建
+            entry = cache.stale_for(self.name, tuple(lines), text_color.name())
+        if entry is None:
+            pm = self._render_label_bitmap(font, lines, scale, text_color, dpr)
+            cache.put(key, pm, scale)
+            entry = (pm, scale)
+        return entry
+
     def paint(self, painter, option, widget=None):  # noqa: N802
         self._apply_pen()
         super().paint(painter, option, widget)
+        if not self.name:
+            return
+        metrics = self._label_metrics()
+        font, lines, rect, pad = metrics
+        if not lines:
+            return
+        pm, entry_scale = self._label_bitmap(metrics, self._label_text_color())
+        if pm.isNull():
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        scene_w = pm.width() / entry_scale
+        scene_h = pm.height() / entry_scale
+        target = QRectF(rect.center().x() - scene_w / 2,
+                        rect.center().y() - scene_h / 2, scene_w, scene_h)
+        painter.drawPixmap(target, pm, QRectF(pm.rect()))
+        painter.restore()
 
 
 # ======================================================================
@@ -408,7 +1048,7 @@ class PinItem(QGraphicsItem):
         text_rect = QRectF(-70, -56, 140, 16)
         painter.setPen(QPen(QColor(0, 0, 0, 100), 2.6))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, self.name)
-        painter.setPen(QPen(QColor("#1F2329")))
+        painter.setPen(QPen(QColor(str(self.canvas.theme.get("text") or "#1F2329"))))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, self.name)
 
     def itemChange(self, change, value):  # noqa: N802
@@ -425,7 +1065,7 @@ class MapCanvas(QGraphicsView):
 
     changed = Signal()            # 数据变化（移动 / 增删 / 编辑，防抖后发出）
     mode_changed = Signal(str)    # 工具模式变化（同步工具条按钮选中态）
-    terrain_changed = Signal()    # 地形增删 / 显隐变化（刷新图例计数）
+    terrain_changed = Signal()    # 地形增删 / 显隐变化（右键菜单计数刷新）
     start_draw_requested = Signal()   # 右键菜单请求进入绘制模式
     start_pin_requested = Signal()    # 右键菜单请求进入点位模式
     start_terrain_requested = Signal()  # 右键菜单请求放置地形
@@ -461,8 +1101,36 @@ class MapCanvas(QGraphicsView):
         self._pending_line: QGraphicsLineItem | None = None
         self._pending_dots: list[QGraphicsEllipseItem] = []
 
+        # 地形路径落点状态：连续点击 / 按住拖动 / 撤销
+        self._terrain_kind = TERRAIN_TYPES[0][0]
+        self._terrain_active: TerrainItem | None = None
+        self._terrain_last_click = 0.0
+        self._terrain_press: QPointF | None = None
+        self._terrain_dragging = False
+        self._terrain_drag_last: QPointF | None = None
+        self._terrain_undo: list[dict] = []
+        self._finish_timer = QTimer(self)
+        self._finish_timer.setSingleShot(True)
+        self._finish_timer.setInterval(TERRAIN_CONTINUE_MS)
+        self._finish_timer.timeout.connect(self.finalize_terrain)
+        self._handle_timer = QTimer(self)
+        self._handle_timer.setSingleShot(True)
+        self._handle_timer.setInterval(420)
+        self._handle_timer.timeout.connect(self._hide_handles_if_idle)
+        self._handle_owner: TerrainItem | None = None
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
         self._mid_panning = False
         self._mid_last = QPointF()
+
+        # 势力名文字位图缓存：跟随地图页存活，切页不清，销毁才释放
+        self._label_bitmaps = LabelBitmapCache()
+        self._labels_prewarmed = False
+        self.last_prewarm_ms = 0.0
+        self._label_zoom_timer = QTimer(self)
+        self._label_zoom_timer.setSingleShot(True)
+        self._label_zoom_timer.setInterval(LABEL_ZOOM_IDLE_MS)
+        self._label_zoom_timer.timeout.connect(self.prewarm_labels)
 
         # 边缘「＋」按钮（上下左右四个方向）
         self._plus_buttons: dict[str, QToolButton] = {}
@@ -569,6 +1237,12 @@ class MapCanvas(QGraphicsView):
         self._hidden_types = {
             str(t) for t in hidden_raw if str(t) in TERRAIN_TYPE_MAP
         } if isinstance(hidden_raw, list) else set()
+        self._terrain_active = None
+        self._terrain_press = None
+        self._terrain_dragging = False
+        self._terrain_undo.clear()
+        self._finish_timer.stop()
+
         for t in data.get("terrains", []):
             if not isinstance(t, dict):
                 continue
@@ -581,17 +1255,64 @@ class MapCanvas(QGraphicsView):
                 str(t.get("note") or ""),
                 str(t.get("color") or "") or terrain_color(kind),
                 t.get("top") is True,
+                self._terrain_points_from_data(t),
                 self,
             )
-            try:
-                item.setPos(float(t.get("x") or 0), float(t.get("y") or 0))
-            except (TypeError, ValueError):
-                item.setPos(0.0, 0.0)
             item.setVisible(kind not in self._hidden_types)
             self._scene.addItem(item)
         self.terrain_changed.emit()
 
         self.reset_view()
+
+    # ------------------------------------------------------------------
+    # 地形路径：归一化坐标 <-> 场景坐标
+    # ------------------------------------------------------------------
+    def _norm_rect(self) -> QRectF:
+        """底图矩形（以数据里的中心 + 宽高为准）；无底图时退回场景矩形。"""
+        bg = self._bg_data or {}
+        try:
+            width = float(bg.get("w") or 0)
+            height = float(bg.get("h") or 0)
+            cx = float(bg.get("x") or 0)
+            cy = float(bg.get("y") or 0)
+        except (TypeError, ValueError):
+            width = height = 0.0
+            cx = cy = 0.0
+        if width > 1.0 and height > 1.0:
+            return QRectF(cx - width / 2, cy - height / 2, width, height)
+        return self._scene.sceneRect()
+
+    def _norm_to_scene(self, nx: float, ny: float) -> QPointF:
+        rect = self._norm_rect()
+        return QPointF(rect.left() + nx * rect.width(), rect.top() + ny * rect.height())
+
+    def _scene_to_norm(self, point: QPointF) -> list[float]:
+        rect = self._norm_rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return [0.0, 0.0]
+        return [
+            round((point.x() - rect.left()) / rect.width(), 5),
+            round((point.y() - rect.top()) / rect.height(), 5),
+        ]
+
+    def _terrain_points_from_data(self, data: dict) -> list[QPointF]:
+        points: list[QPointF] = []
+        raw = data.get("points")
+        if isinstance(raw, list):
+            for pair in raw:
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                try:
+                    points.append(self._norm_to_scene(float(pair[0]), float(pair[1])))
+                except (TypeError, ValueError):
+                    continue
+        if not points:
+            # 兜底：旧数据只有 x/y 时按单点路径载入
+            try:
+                points = [QPointF(float(data.get("x") or 0), float(data.get("y") or 0))]
+            except (TypeError, ValueError):
+                points = [QPointF(0.0, 0.0)]
+        return points
 
     def collect(self) -> dict:
         factions: list[dict] = []
@@ -625,7 +1346,6 @@ class MapCanvas(QGraphicsView):
                     }
                 )
             elif isinstance(item, TerrainItem):
-                pos = item.pos()
                 terrains.append(
                     {
                         "id": item.tid,
@@ -634,8 +1354,7 @@ class MapCanvas(QGraphicsView):
                         "note": item.note,
                         "color": item.color,
                         "top": bool(item.top),
-                        "x": round(pos.x(), 2),
-                        "y": round(pos.y(), 2),
+                        "points": [self._scene_to_norm(p) for p in item.scene_points()],
                     }
                 )
         rect = self._scene.sceneRect()
@@ -732,6 +1451,8 @@ class MapCanvas(QGraphicsView):
             mode = "pan"
         if mode == self._mode:
             return
+        if self._mode == "terrain":
+            self.finalize_terrain()
         self._cancel_pending()
         self._mode = mode
         self._apply_mode()
@@ -838,6 +1559,37 @@ class MapCanvas(QGraphicsView):
         self._zoom = 1.0
         self.resetTransform()
         self.centerOn(self._scene.sceneRect().center())
+        self._label_zoom_timer.start()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if not self._labels_prewarmed:
+            self._labels_prewarmed = True
+            QTimer.singleShot(0, self.prewarm_labels)
+
+    def prewarm_labels(self, limit: int = 24) -> float:
+        """预生成当前可视区内的框名位图（约 10–20 张），避免首帧 miss。"""
+        started = time.perf_counter()
+        view_rect = self.mapToScene(self.viewport().rect()).boundingRect()
+        if view_rect.isEmpty():
+            view_rect = self._scene.sceneRect()
+        made = 0
+        for item in self._scene.items():
+            if not isinstance(item, FactionItem) or not item.name:
+                continue
+            if not item.sceneBoundingRect().intersects(view_rect):
+                continue
+            item._label_bitmap()
+            made += 1
+            if made >= limit:
+                break
+        self.last_prewarm_ms = (time.perf_counter() - started) * 1000.0
+        return self.last_prewarm_ms
+
+    def clear_label_cache(self) -> None:
+        """只释放文字位图缓存；缩放比例、选中项、滚动位置一律不动。"""
+        self._label_bitmaps.clear()
+        self.update()
 
     def zoom_steps(self, steps: float) -> None:
         """按滚轮格数缩放（以视口中心为锚，供 Ctrl+滚轮调用）。"""
@@ -848,6 +1600,8 @@ class MapCanvas(QGraphicsView):
         if ZOOM_MIN <= new_zoom <= ZOOM_MAX:
             self._zoom = new_zoom
             self.scale(factor, factor)
+            # 缩放中先用旧字号档的位图顶着，停手后再补新档
+            self._label_zoom_timer.start()
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
@@ -884,7 +1638,10 @@ class MapCanvas(QGraphicsView):
             return
 
         if self._mode == "terrain" and event.button() == Qt.MouseButton.LeftButton:
-            self._place_terrain(scene_pos)
+            self.setFocus()
+            self._terrain_press = QPointF(scene_pos)
+            self._terrain_drag_last = None
+            self._terrain_dragging = False
             event.accept()
             return
 
@@ -898,6 +1655,22 @@ class MapCanvas(QGraphicsView):
             v_bar = self.verticalScrollBar()
             h_bar.setValue(int(h_bar.value() - delta.x()))
             v_bar.setValue(int(v_bar.value() - delta.y()))
+            event.accept()
+            return
+
+        if self._mode == "terrain" and self._terrain_press is not None:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if not self._terrain_dragging:
+                delta = scene_pos - self._terrain_press
+                if (delta.x() ** 2 + delta.y() ** 2) ** 0.5 >= 4.0:
+                    self._terrain_dragging = True
+                    self._terrain_add_point(self._terrain_press)
+                    self._terrain_drag_last = QPointF(self._terrain_press)
+            if self._terrain_dragging:
+                last = self._terrain_drag_last or self._terrain_press
+                if (scene_pos - last).manhattanLength() >= TERRAIN_MIN_STEP:
+                    self._terrain_add_point(scene_pos)
+                    self._terrain_drag_last = QPointF(scene_pos)
             event.accept()
             return
 
@@ -918,6 +1691,19 @@ class MapCanvas(QGraphicsView):
             )
             event.accept()
             return
+
+        if (self._mode == "terrain"
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._terrain_press is not None):
+            if not self._terrain_dragging:
+                self._terrain_add_point(self.mapToScene(event.position().toPoint()))
+            self._terrain_press = None
+            self._terrain_dragging = False
+            self._terrain_drag_last = None
+            self._finish_timer.start()
+            event.accept()
+            return
+
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
@@ -933,6 +1719,18 @@ class MapCanvas(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
+        raw_item = next(iter(self.items(event.pos())), None)
+        if isinstance(raw_item, TerrainNodeItem):
+            owner = raw_item.owner
+            menu = QMenu(self)
+            if len(owner.points) > 1:
+                menu.addAction("删除该节点",
+                               lambda: self.remove_terrain_point(owner, raw_item.index))
+            menu.addSeparator()
+            menu.addAction("删除整条地形", lambda: self._remove_terrain(owner))
+            menu.exec(event.globalPos())
+            return
+
         item = self._top_item_at(event.pos())
         if isinstance(item, (FactionItem, PinItem, TerrainItem)):
             item.setSelected(True)
@@ -949,7 +1747,7 @@ class MapCanvas(QGraphicsView):
                 top_action.setCheckable(True)
                 top_action.setChecked(bool(item.top))
                 menu.addSeparator()
-                menu.addAction("删除地形", lambda: self._remove_item(item))
+                menu.addAction("删除整条地形", lambda: self._remove_terrain(item))
             else:
                 menu.addAction("编辑点位", lambda: self._edit_item(item))
                 menu.addSeparator()
@@ -961,13 +1759,37 @@ class MapCanvas(QGraphicsView):
             self._finish_pending()
             return
 
+        self.finalize_terrain()
         menu = QMenu(self)
         menu.addAction("添加势力", self.start_draw_requested.emit)
         menu.addAction("添加点位", self.start_pin_requested.emit)
         menu.addAction("添加地形", self.start_terrain_requested.emit)
         menu.addSeparator()
+
+        # 原图例浮层：全显 / 全隐 / 分类型显隐，挪到空白处右键菜单
+        menu.addMenu(self.build_terrain_visibility_menu())
+
+        menu.addSeparator()
         menu.addAction("复位视图", self.reset_view)
         menu.exec(event.globalPos())
+
+    def build_terrain_visibility_menu(self) -> QMenu:
+        """右键菜单「地形显示」子菜单：全显 / 全隐 / 按类型勾选（持久化到 terrain_hidden）。"""
+        menu = QMenu("地形显示", self)
+        show_all = menu.addAction("全部显示")
+        show_all.triggered.connect(lambda _c=False: self.set_all_types_visible(True))
+        hide_all = menu.addAction("全部隐藏")
+        hide_all.triggered.connect(lambda _c=False: self.set_all_types_visible(False))
+        menu.addSeparator()
+        counts = self.terrain_counts()
+        for kind, label, _color in TERRAIN_TYPES:
+            action = menu.addAction(f"{label}（{counts.get(kind, 0)}）")
+            action.setCheckable(True)
+            action.setChecked(self.is_type_visible(kind))
+            action.toggled.connect(
+                lambda checked, k=kind: self.set_type_visible(k, bool(checked))
+            )
+        return menu
 
     # ------------------------------------------------------------------
     # 绘制势力（多边形点集）
@@ -1047,22 +1869,134 @@ class MapCanvas(QGraphicsView):
         self.set_mode("pan")
 
     # ------------------------------------------------------------------
-    # 地形标注
+    # 地形标注（路径式落点）
     # ------------------------------------------------------------------
-    def start_terrain(self) -> None:
+    def start_terrain(self, kind: str | None = None) -> None:
+        if kind:
+            self.set_terrain_kind(kind)
         self.set_mode("terrain")
 
-    def _place_terrain(self, scene_pos: QPointF) -> None:
-        dialog = TerrainEditDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            kind, name, note, color, top = dialog.values()
-            item = TerrainItem(new_id(), kind, name, note, color, top, self)
-            item.setPos(scene_pos)
-            item.setVisible(kind not in self._hidden_types)
+    def set_terrain_kind(self, kind: str) -> None:
+        if kind not in TERRAIN_TYPE_MAP:
+            return
+        if kind != self._terrain_kind:
+            self.finalize_terrain()
+            self._terrain_kind = kind
+
+    def _terrain_add_point(self, scene_pos: QPointF) -> None:
+        """单击 / 拖动落点：同一类型且时间窗内则并入当前路径，否则新开一条。"""
+        now = time.monotonic()
+        active = self._terrain_active
+        can_continue = (
+            active is not None
+            and active.kind == self._terrain_kind
+            and active.scene() is not None
+            and now - self._terrain_last_click <= TERRAIN_CONTINUE_MS / 1000.0
+        )
+        if not can_continue:
+            self.finalize_terrain()
+            if not self.is_type_visible(self._terrain_kind):
+                self.set_type_visible(self._terrain_kind, True)
+            item = TerrainItem(
+                new_id(),
+                self._terrain_kind,
+                terrain_label(self._terrain_kind),
+                "",
+                terrain_color(self._terrain_kind),
+                False,
+                [QPointF(scene_pos)],
+                self,
+            )
             self._scene.addItem(item)
+            self._terrain_active = item
+            self._push_terrain_undo({"op": "add_path", "id": item.tid})
+        else:
+            last = active.points[-1]
+            if (scene_pos - last).manhattanLength() < 1.0:
+                return
+            index = active.add_point(scene_pos)
+            self._push_terrain_undo(
+                {"op": "add_point", "id": active.tid, "index": index}
+            )
+        self._terrain_last_click = now
+        self.terrain_changed.emit()
+        self._emit_changed()
+
+    def finalize_terrain(self) -> None:
+        """结束当前路径（3 秒无新点 / 切模式 / 右键空白）。数据已在画布中。"""
+        self._finish_timer.stop()
+        if self._terrain_active is not None:
+            self._terrain_active = None
+            self.terrain_changed.emit()
+
+    def _push_terrain_undo(self, action: dict) -> None:
+        self._terrain_undo.append(action)
+        if len(self._terrain_undo) > TERRAIN_UNDO_MAX:
+            del self._terrain_undo[0]
+
+    def _terrain_by_id(self, tid: str) -> "TerrainItem | None":
+        for item in self._scene.items():
+            if isinstance(item, TerrainItem) and item.tid == tid:
+                return item
+        return None
+
+    def undo_terrain(self) -> bool:
+        """Ctrl+Z：撤销上一次落点 / 上一条路径。"""
+        if not self._terrain_undo:
+            return False
+        action = self._terrain_undo.pop()
+        item = self._terrain_by_id(str(action.get("id") or ""))
+        if action.get("op") == "add_point":
+            if item is not None and len(item.points) > 1:
+                index = action.get("index")
+                if not isinstance(index, int) or not (0 <= index < len(item.points)):
+                    index = len(item.points) - 1
+                item.remove_point(index)
+            elif item is not None:
+                self._remove_terrain(item)
+        else:
+            if item is not None:
+                self._remove_terrain(item)
+        self._emit_changed()
+        self.terrain_changed.emit()
+        return True
+
+    def remove_terrain_point(self, item: "TerrainItem", index: int) -> None:
+        if item.remove_point(index):
             self._emit_changed()
             self.terrain_changed.emit()
-        self.set_mode("pan")
+        else:
+            self._remove_terrain(item)
+
+    def _remove_terrain(self, item: "TerrainItem") -> None:
+        if item is self._terrain_active:
+            self.finalize_terrain()
+        self._scene.removeItem(item)
+        self._emit_changed()
+        self.terrain_changed.emit()
+
+    def _remove_selected_terrain(self) -> bool:
+        nodes = [i for i in self._scene.selectedItems() if isinstance(i, TerrainNodeItem)]
+        if nodes:
+            for node in nodes:
+                self.remove_terrain_point(node.owner, node.index)
+            return True
+        items = [i for i in self._scene.selectedItems() if isinstance(i, TerrainItem)]
+        for item in items:
+            self._remove_terrain(item)
+        return bool(items)
+
+    def schedule_handles_hide(self, item: "TerrainItem") -> None:
+        self._handle_owner = item
+        self._handle_timer.start()
+
+    def _hide_handles_if_idle(self) -> None:
+        item = self._handle_owner
+        if item is None or item.scene() is None:
+            return
+        if item.isSelected() or item._hovered or item._node_hover:
+            return
+        item.set_handles_visible(False)
 
     def _toggle_terrain_top(self, item: "TerrainItem") -> None:
         item.set_top(not item.top)
@@ -1070,7 +2004,7 @@ class MapCanvas(QGraphicsView):
         self._emit_changed()
 
     def set_type_visible(self, kind: str, visible: bool) -> None:
-        """图例开关：按类型整组显示 / 隐藏（选择状态保留）；无变化不落盘。"""
+        """按类型整组显示 / 隐藏（选择状态保留）；无变化不落盘。"""
         if kind not in TERRAIN_TYPE_MAP:
             return
         hidden_now = kind in self._hidden_types
@@ -1136,10 +2070,7 @@ class MapCanvas(QGraphicsView):
                 item.note = note
                 item.color = color or terrain_color(item.kind)
                 item.set_top(top)
-                item.setToolTip(
-                    f"{item.name}（{terrain_label(item.kind)}）\n{item.note}" if item.note
-                    else f"{item.name}（{terrain_label(item.kind)}）"
-                )
+                item._refresh_tooltip()
                 item.setVisible(item.kind not in self._hidden_types)
                 item.update()
                 self._emit_changed()
@@ -1156,24 +2087,41 @@ class MapCanvas(QGraphicsView):
                 self._emit_changed()
 
     def _remove_item(self, item) -> None:
-        self._scene.removeItem(item)
         if isinstance(item, TerrainItem):
-            self.terrain_changed.emit()
+            self._remove_terrain(item)
+            return
+        self._scene.removeItem(item)
         self._emit_changed()
 
     # ------------------------------------------------------------------
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.matches(QKeySequence.StandardKey.Undo):
+            if self.undo_terrain():
+                event.accept()
+                return
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self._remove_selected_terrain():
+                event.accept()
+                return
         if event.key() == Qt.Key.Key_Escape:
             if self._mode == "draw":
                 self._cancel_pending(keep_mode=False)
+            elif self._mode == "terrain":
+                self.finalize_terrain()
+                self.set_mode("pan")
             else:
                 self.set_mode("pan")
             event.accept()
             return
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self._mode == "draw":
-            self._finish_pending()
-            event.accept()
-            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._mode == "draw":
+                self._finish_pending()
+                event.accept()
+                return
+            if self._mode == "terrain":
+                self.finalize_terrain()
+                event.accept()
+                return
         super().keyPressEvent(event)
 
 
@@ -1421,7 +2369,7 @@ class TerrainEditDialog(QDialog):
 # 主窗口
 # ======================================================================
 class MapDialog(QDialog):
-    """地图主窗口：工具条 + QGraphicsView 画布 + 地形图例 + 边缘扩展按钮。"""
+    """地图主窗口：工具条 + 地形类型选择 + QGraphicsView 画布 + 边缘扩展按钮。"""
 
     changed = Signal()  # 数据变化（由主窗口负责持久化到 map_global.json）
 
@@ -1466,12 +2414,25 @@ class MapDialog(QDialog):
         self.draw_button = add_button("添加势力", self._start_draw, checkable=True)
         self.pin_button = add_button("添加点位", self._start_pin, checkable=True)
         self.terrain_button = add_button("添加地形", self._start_terrain, checkable=True)
+        self.terrain_kind_box = QComboBox(bar)
+        self.terrain_kind_box.setObjectName("MapTerrainKind")
+        self.terrain_kind_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.terrain_kind_box.setToolTip("当前要落点的地形类型")
+        self.terrain_kind_box.setFixedWidth(104)
+        for key, label, color in TERRAIN_TYPES:
+            self.terrain_kind_box.addItem(terrain_pixmap(key, color, 18), label, key)
+        self.terrain_kind_box.currentIndexChanged.connect(
+            lambda _index: self.canvas.set_terrain_kind(
+                str(self.terrain_kind_box.currentData())
+            )
+        )
+        bar_layout.addWidget(self.terrain_kind_box)
         add_button("导入底图", self._import_bg)
         add_button("清除底图", self._clear_bg)
         add_button("导出图片", self._export_png)
         self.save_button = add_button("保存", self._flush_save)
 
-        hint = QLabel("Ctrl+滚轮缩放 · 拖动平移 · 右键编辑 · 右侧图例可显隐地形", bar)
+        hint = QLabel("Ctrl+滚轮缩放 · 拖动平移 · 右键编辑 · 地形显隐在右键菜单", bar)
         hint.setObjectName("DrawerHint")
         bar_layout.addWidget(hint)
         layout.addWidget(bar)
@@ -1488,10 +2449,6 @@ class MapDialog(QDialog):
         self.canvas.start_pin_requested.connect(self._start_pin)
         self.canvas.start_terrain_requested.connect(self._start_terrain)
         layout.addWidget(self.canvas, 1)
-
-        # 地形图例浮层（图标 + 名称 + 计数 + 显隐复选）
-        self._build_legend(theme)
-        self.canvas.terrain_changed.connect(self._refresh_legend)
 
         # Esc 取消当前工具 / 回到漫游（不关闭窗口）
         esc_sc = QShortcut(QKeySequence("Escape"), self)
@@ -1519,122 +2476,13 @@ class MapDialog(QDialog):
         if self.canvas.mode() == "terrain":
             self.canvas.set_mode("pan")
         else:
-            self.canvas.start_terrain()
+            self.canvas.start_terrain(str(self.terrain_kind_box.currentData()))
         self._sync_tool_buttons(self.canvas.mode())
 
     def _sync_tool_buttons(self, mode: str) -> None:
         self.draw_button.setChecked(mode == "draw")
         self.pin_button.setChecked(mode == "pin")
         self.terrain_button.setChecked(mode == "terrain")
-
-    # ------------------------------------------------------------------
-    # 地形图例浮层
-    # ------------------------------------------------------------------
-    def _build_legend(self, theme: dict) -> None:
-        panel = QWidget(self.canvas.viewport())
-        panel.setObjectName("MapLegend")
-        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        panel.setStyleSheet(
-            f"QWidget#MapLegend {{background: {theme['panel']};"
-            f" border: 1px solid {theme['border_strong']}; border-radius: 10px;}}"
-            f"QToolButton {{border:none; background:transparent; text-align:left;"
-            f" color:{theme['text']}; padding:2px 4px;}}"
-            f"QToolButton:hover {{background:{theme.get('hover', theme['panel_alt'])};"
-            " border-radius:6px;}"
-            "QLabel {color:" + theme["text"] + ";}"
-        )
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(10, 8, 10, 8)
-        lay.setSpacing(2)
-        head = QHBoxLayout()
-        title = QLabel("地形", panel)
-        from PySide6.QtGui import QFont as _QFont
-        f = _QFont()
-        f.setBold(True)
-        f.setPixelSize(13)
-        title.setFont(f)
-        head.addWidget(title)
-        head.addStretch(1)
-        all_btn = QToolButton(panel)
-        all_btn.setText("全显")
-        all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        all_btn.clicked.connect(lambda: self._set_all_types(True))
-        none_btn = QToolButton(panel)
-        none_btn.setText("全隐")
-        none_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        none_btn.clicked.connect(lambda: self._set_all_types(False))
-        head.addWidget(all_btn)
-        head.addWidget(none_btn)
-        lay.addLayout(head)
-
-        self._legend_rows: dict[str, tuple] = {}
-        for key, label, color in TERRAIN_TYPES:
-            row = QHBoxLayout()
-            row.setSpacing(6)
-            icon = QLabel(panel)
-            icon.setPixmap(terrain_pixmap(key, color, 20))
-            icon.setFixedWidth(24)
-            icon.setAlignment(Qt.AlignCenter)
-            name_btn = QToolButton(panel)
-            name_btn.setText(label)
-            name_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            name_btn.setToolTip(f"在地图上{ '隐藏' if self.canvas.is_type_visible(key) else '显示' }{label}")
-            name_btn.clicked.connect(lambda _c=False, k=key:
-                                     self.canvas.set_type_visible(k, not self.canvas.is_type_visible(k)))
-            count = QLabel("0", panel)
-            count.setObjectName("LegendCount")
-            count.setFixedWidth(20)
-            count.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            check = QCheckBox(panel)
-            check.setChecked(self.canvas.is_type_visible(key))
-            check.setToolTip("显示 / 隐藏该类型")
-            check.stateChanged.connect(
-                lambda state, k=key: self.canvas.set_type_visible(k, state == Qt.CheckState.Checked.value)
-            )
-            row.addWidget(icon)
-            row.addWidget(name_btn, 1)
-            row.addWidget(count)
-            row.addWidget(check)
-            lay.addLayout(row)
-            self._legend_rows[key] = (count, check, name_btn)
-        self._legend_panel = panel
-        panel.adjustSize()
-
-        self._legend_viewport = self.canvas.viewport()
-        self._legend_viewport.installEventFilter(self)
-        self._position_legend()
-        self._refresh_legend()
-
-    def _set_all_types(self, visible: bool) -> None:
-        self.canvas.set_all_types_visible(visible)
-
-    def _position_legend(self) -> None:
-        vp = self.canvas.viewport()
-        panel = getattr(self, "_legend_panel", None)
-        if panel is None:
-            return
-        panel.adjustSize()
-        panel.move(vp.width() - panel.width() - 12, 12)
-        panel.raise_()
-
-    def _refresh_legend(self) -> None:
-        counts = self.canvas.terrain_counts()
-        for key, (count_label, check, name_btn) in self._legend_rows.items():
-            count_label.setText(str(counts.get(key, 0)))
-            visible = self.canvas.is_type_visible(key)
-            if check.isChecked() != visible:
-                check.setChecked(visible)
-            label = next(l for k, l, _c in TERRAIN_TYPES if k == key)
-            name_btn.setToolTip(f"在地图上{'隐藏' if visible else '显示'}{label}")
-        self._position_legend()
-
-    def eventFilter(self, obj, event) -> bool:  # noqa: N802
-        from PySide6.QtCore import QEvent
-
-        if obj is self.canvas.viewport() and event.type() == QEvent.Type.Resize:
-            self._position_legend()
-        return super().eventFilter(obj, event)
-
 
     def _import_bg(self) -> None:
         self.canvas.import_bg()
@@ -1676,17 +2524,6 @@ class MapDialog(QDialog):
 
     def set_theme(self, theme: dict) -> None:
         self.canvas.set_theme(theme)
-        panel = getattr(self, "_legend_panel", None)
-        if panel is not None:
-            panel.setStyleSheet(
-                f"QWidget#MapLegend {{background: {theme['panel']};"
-                f" border: 1px solid {theme['border_strong']}; border-radius: 10px;}}"
-                f"QToolButton {{border:none; background:transparent; text-align:left;"
-                f" color:{theme['text']}; padding:2px 4px;}}"
-                f"QToolButton:hover {{background:{theme.get('hover', theme['panel_alt'])};"
-                " border-radius:6px;}"
-                f"QLabel {{color:{theme['text']};}}"
-            )
 
     # ------------------------------------------------------------------
     def _export_png(self) -> None:

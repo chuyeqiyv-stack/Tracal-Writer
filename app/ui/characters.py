@@ -62,6 +62,11 @@ from app.models import (
     GENDER_FIELD,
     new_id,
 )
+from app.services.character_templates import (
+    MAX_NAME_LEN,
+    CharacterTemplateStore,
+    TemplateLimitError,
+)
 from app.ui import motion
 from app.ui.dialogs import MessageBox
 from app.ui.icons import IconFactory, flash_saved
@@ -138,9 +143,20 @@ class CharacterDialog(QDialog):
     收在「更多资料」里，能力不丢失。values() 返回完整角色 dict。
     """
 
-    def __init__(self, parent, character: dict | None = None) -> None:
+    def __init__(self, parent, character: dict | None = None, storage=None) -> None:
         super().__init__(parent)
         src = character or {}
+        # 新建角色：默认套用「最后一次使用」的模板（只预填标签类字段）
+        self._storage = storage if storage is not None else getattr(parent, "storage", None)
+        self._template_store = (
+            CharacterTemplateStore(self._storage) if self._storage is not None else None
+        )
+        self._used_template_id = ""
+        if not src and self._template_store is not None:
+            tpl = self._template_store.default_template()
+            if tpl is not None:
+                src = dict(tpl["fields"])
+                self._used_template_id = tpl["id"]
         self._src = dict(src)
         self.char_id = str(src.get("id") or "")
         # 人物短章（小书本右键编辑，随角色一起保存）
@@ -173,6 +189,12 @@ class CharacterDialog(QDialog):
         self._refresh_book_hint()
         top_row.addWidget(self.book_button)
         outer.addLayout(top_row)
+
+        # 新建时才有模板入口：一行「模板 ▾ · 空白新建 · 存为模板 · ⋯」，不铺开面板
+        self.template_box = None
+        self.template_hint = None
+        if not self.char_id and self._template_store is not None:
+            outer.addLayout(self._build_template_row())
 
         # 长表单放进滚动区（常驻条关闭，只留隐形滑块）
         scroll = QScrollArea(self)
@@ -321,6 +343,196 @@ class CharacterDialog(QDialog):
         outer.addLayout(buttons)
 
         self.name_edit.setFocus()
+
+    # ------------------------------------------------------------------
+    # 模板入口（仅新建）：套用 / 空白新建 / 存为模板 / 重命名 / 删除
+    # ------------------------------------------------------------------
+    def _build_template_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        lab = QLabel("模板", self)
+        lab.setObjectName("FormLabel")
+        row.addWidget(lab)
+
+        self.template_box = QComboBox(self)
+        self.template_box.setMinimumWidth(150)
+        self.template_box.setToolTip("选择模板会立即套用标签类字段；不影响姓名与正文")
+        self.template_box.currentIndexChanged.connect(self._on_template_selected)
+        row.addWidget(self.template_box)
+
+        self.blank_button = QPushButton("空白新建", self)
+        self.blank_button.setObjectName("GhostButton")
+        self.blank_button.setCursor(Qt.PointingHandCursor)
+        self.blank_button.setToolTip("不套用任何模板，清空标签类字段")
+        self.blank_button.clicked.connect(self._blank_new)
+        row.addWidget(self.blank_button)
+
+        save_button = QPushButton("存为模板", self)
+        save_button.setObjectName("GhostButton")
+        save_button.setCursor(Qt.PointingHandCursor)
+        save_button.setToolTip("把当前标签类字段存成模板（最多 5 个）")
+        save_button.clicked.connect(self._save_as_template)
+        row.addWidget(save_button)
+
+        self.template_more = QToolButton(self)
+        self.template_more.setObjectName("GhostButton")
+        self.template_more.setText("⋯")
+        self.template_more.setCursor(Qt.PointingHandCursor)
+        self.template_more.setToolTip("重命名 / 删除当前模板")
+        menu = QMenu(self.template_more)
+        menu.addAction("重命名当前模板", self._rename_current_template)
+        menu.addAction("删除当前模板", self._delete_current_template)
+        self.template_more.setMenu(menu)
+        self.template_more.setPopupMode(QToolButton.InstantPopup)
+        row.addWidget(self.template_more)
+
+        self.template_hint = QLabel("", self)
+        self.template_hint.setObjectName("CharDetailSub")
+        row.addWidget(self.template_hint)
+        row.addStretch(1)
+
+        self._reload_template_box(self._used_template_id)
+        return row
+
+    def _reload_template_box(self, select_id: str = "") -> None:
+        if self.template_box is None or self._template_store is None:
+            return
+        self.template_box.blockSignals(True)
+        self.template_box.clear()
+        self.template_box.addItem("（不使用模板）", "")
+        for tpl in self._template_store.templates():
+            self.template_box.addItem(tpl["name"], tpl["id"])
+        idx = self.template_box.findData(select_id) if select_id else 0
+        self.template_box.setCurrentIndex(max(0, idx))
+        self.template_box.blockSignals(False)
+        self._update_template_hint()
+
+    def _update_template_hint(self) -> None:
+        if self.template_hint is None or self._template_store is None:
+            return
+        tpl = self._template_store.default_template()
+        self.template_hint.setText(
+            f"默认：{tpl['name']}" if tpl is not None else "默认：无（新建时空白）"
+        )
+
+    def _on_template_selected(self, _index: int) -> None:
+        tid = str(self.template_box.currentData() or "")
+        if tid == self._used_template_id:
+            return
+        if not tid:
+            self._blank_new()
+            return
+        tpl = self._template_store.get(tid) if self._template_store is not None else None
+        if tpl is None:
+            return
+        self._fill_profile(tpl["fields"])
+        self._used_template_id = tid
+        self._update_template_hint()
+
+    def _fill_profile(self, fields: dict) -> None:
+        """只覆盖标签类字段；姓名 / 道号 / 生平 / 目标 / 备注保持用户当前输入。"""
+        self.role_box.setCurrentText(str(fields.get("role") or "配角"))
+        self.age_edit.setText(str(fields.get("age") or ""))
+        self.tags_edit.setText("，".join(str(t) for t in fields.get("tags") or []))
+        self._appearance_edit.setPlainText(str(fields.get("appearance") or ""))
+        self._personality_edit.setPlainText(str(fields.get("personality") or ""))
+        self._speech_edit.setPlainText(str(fields.get("speech") or ""))
+        self._boxed = Character._parse_card_fields(
+            fields.get("card_fields"), str(fields.get("gender") or "")
+        )
+        for item in self._boxed:
+            item["chip"] = None
+            item["edit"] = None
+        self._rebuild_boxed()
+
+    def _blank_new(self) -> None:
+        self._fill_profile({})
+        self._used_template_id = ""
+        if self.template_box is not None:
+            self.template_box.blockSignals(True)
+            self.template_box.setCurrentIndex(0)
+            self.template_box.blockSignals(False)
+        self.name_edit.setFocus()
+
+    def _save_as_template(self) -> None:
+        if self._template_store is None:
+            return
+        values = self._current_values()
+        default_name = "" if values["name"] == "未命名角色" else values["name"]
+        name, ok = QInputDialog.getText(self, "保存为模板", "模板名称：", text=default_name)
+        if not ok:
+            return
+        name = name.strip()[:MAX_NAME_LEN]
+        if not name:
+            MessageBox.warning(self, "模板名称为空", "请填写模板名称后再保存。")
+            return
+        existing = self._template_store.find_by_name(name)
+        if existing is not None:
+            if not MessageBox.question(
+                self, "模板重名", f"已有同名模板「{name}」，要覆盖它吗？"
+            ):
+                return
+            tpl = self._template_store.save_template(name, values, overwrite_id=existing["id"])
+            self._reload_template_box(tpl["id"])
+            self._used_template_id = tpl["id"]
+            return
+        try:
+            tpl = self._template_store.save_template(name, values)
+        except TemplateLimitError:
+            oldest = self._template_store.oldest()
+            if oldest is None or not MessageBox.question(
+                self,
+                "模板已满",
+                f"最多保存 5 个模板。要覆盖最久未使用的「{oldest['name']}」吗？\n"
+                "选择「否」将取消本次保存。",
+            ):
+                return
+            tpl = self._template_store.save_template(
+                name, values, overwrite_id=oldest["id"]
+            )
+        self._reload_template_box(tpl["id"])
+        self._used_template_id = tpl["id"]
+
+    def _rename_current_template(self) -> None:
+        if self._template_store is None or self.template_box is None:
+            return
+        tid = str(self.template_box.currentData() or "")
+        tpl = self._template_store.get(tid)
+        if tpl is None:
+            MessageBox.information(self, "未选择模板", "请先在下拉框选择一个模板。")
+            return
+        name, ok = QInputDialog.getText(
+            self, "重命名模板", "新的模板名称：", text=tpl["name"]
+        )
+        if not ok:
+            return
+        name = name.strip()[:MAX_NAME_LEN]
+        if not name:
+            MessageBox.warning(self, "模板名称为空", "请填写模板名称。")
+            return
+        clash = self._template_store.find_by_name(name)
+        overwrite = False
+        if clash is not None and clash["id"] != tid:
+            if not MessageBox.question(self, "模板重名", f"已有同名模板「{name}」，覆盖它吗？"):
+                return
+            overwrite = True
+        if self._template_store.rename(tid, name, overwrite=overwrite):
+            self._reload_template_box(tid)
+            self._used_template_id = tid
+
+    def _delete_current_template(self) -> None:
+        if self._template_store is None or self.template_box is None:
+            return
+        tid = str(self.template_box.currentData() or "")
+        tpl = self._template_store.get(tid)
+        if tpl is None:
+            MessageBox.information(self, "未选择模板", "请先在下拉框选择一个模板。")
+            return
+        if not MessageBox.question(self, "删除模板", f"确定删除模板「{tpl['name']}」吗？"):
+            return
+        self._template_store.delete(tid)
+        self._used_template_id = ""
+        self._reload_template_box("")
 
     # ------------------------------------------------------------------
     # 方框属性
@@ -481,6 +693,9 @@ class CharacterDialog(QDialog):
             MessageBox.warning(self, "缺少姓名", "请先填写角色姓名。")
             self.name_edit.setFocus()
             return
+        # 用模板新建成功 → 该模板成为下一次新建的默认模板
+        if not self.char_id and self._used_template_id and self._template_store is not None:
+            self._template_store.mark_used(self._used_template_id)
         self.accept()
 
     def values(self) -> dict:

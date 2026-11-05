@@ -46,6 +46,8 @@ class Storage:
         self.book_words_file = self.base_dir / "book_words.json"
         self.book_medals_file = self.base_dir / "book_medals.json"
         self.achievements_file = self.base_dir / "achievements.json"
+        self.snippets_file = self.base_dir / "snippets.json"
+        self.character_templates_file = self.base_dir / "character_templates.json"
         self.books_dir = self.base_dir / "books"
         self.covers_dir = self.base_dir / "covers"
         self.history_dir = self.base_dir / "history"
@@ -109,6 +111,91 @@ class Storage:
 
     def save_settings(self, settings: Settings) -> None:
         self._write_json(self.settings_file, settings.to_dict())
+
+    # ------------------------------------------------------------------
+    # 文笔仿写片段（snippets.json，全书共享；不进 library.json）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_snippet(raw: dict, index: int, seen: set[str]) -> dict | None:
+        """容错归一化：缺键 / 类型错误 / 重复 id 都兜底，空内容条目丢弃。"""
+        if not isinstance(raw, dict):
+            return None
+        content = raw.get("content")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        if not content.strip():
+            return None
+        sid = str(raw.get("id") or "").strip() or new_id()
+        if sid in seen:
+            sid = new_id()
+        seen.add(sid)
+        try:
+            created = float(raw.get("created_at") or 0.0)
+        except (TypeError, ValueError):
+            created = 0.0
+        if created <= 0:
+            created = time.time()
+        try:
+            updated = float(raw.get("updated_at") or created)
+        except (TypeError, ValueError):
+            updated = created
+        try:
+            order = int(raw.get("order"))
+        except (TypeError, ValueError):
+            order = index
+        source = raw.get("source")
+        if not isinstance(source, str):
+            source = "" if source is None else str(source)
+        return {
+            "id": sid,
+            "content": content,
+            "source": source,
+            "created_at": created,
+            "updated_at": updated,
+            "order": order,
+        }
+
+    def load_snippets(self) -> list[dict]:
+        """读取全书共享片段；文件缺失 / 旧备份无此文件 / 缺键均不报错。"""
+        data = self._read_json(self.snippets_file, [])
+        raw = data.get("snippets") if isinstance(data, dict) else data
+        if not isinstance(raw, list):
+            raw = []
+        seen: set[str] = set()
+        items: list[dict] = []
+        for index, entry in enumerate(raw):
+            item = self._normalize_snippet(entry, index, seen)
+            if item:
+                items.append(item)
+        items.sort(key=lambda x: (x["order"], x["created_at"], x["id"]))
+        for index, item in enumerate(items):
+            item["order"] = index
+        return items
+
+    def save_snippets(self, items: list[dict]) -> None:
+        seen: set[str] = set()
+        clean: list[dict] = []
+        for index, entry in enumerate(items):
+            item = self._normalize_snippet(entry, index, seen)
+            if item:
+                clean.append(item)
+        clean.sort(key=lambda x: (x["order"], x["created_at"], x["id"]))
+        for index, item in enumerate(clean):
+            item["order"] = index
+        self._write_json(self.snippets_file, {"version": 1, "snippets": clean})
+
+    # ------------------------------------------------------------------
+    # 新建角色模板（character_templates.json，全局共享；不进 library.json）
+    # ------------------------------------------------------------------
+    def load_character_templates(self) -> dict:
+        from app.services.character_templates import sanitize_document
+
+        return sanitize_document(self._read_json(self.character_templates_file, {}))
+
+    def save_character_templates(self, document: dict) -> None:
+        from app.services.character_templates import sanitize_document
+
+        self._write_json(self.character_templates_file, sanitize_document(document))
 
     # ------------------------------------------------------------------
     # 书架索引
@@ -800,6 +887,11 @@ class Storage:
         hidden_raw = raw.get("terrain_hidden")
         terrain_hidden = [str(t) for t in hidden_raw if str(t) in terrain_keys] \
             if isinstance(hidden_raw, list) else []
+        ref = Storage._map_ref_rect(raw, (left, top, width, height))
+        terrains = [
+            Storage._normalize_terrain(t, ref, terrain_keys)
+            for t in (raw.get("terrains") or []) if isinstance(t, dict)
+        ]
         return {
             "id": str(raw.get("id") or new_id()),
             "title": str(raw.get("title") or "未命名地图"),
@@ -808,10 +900,56 @@ class Storage:
             "bg": raw.get("bg") if isinstance(raw.get("bg"), dict) else None,
             "factions": [f for f in (raw.get("factions") or []) if isinstance(f, dict)],
             "pins": [p for p in (raw.get("pins") or []) if isinstance(p, dict)],
-            "terrains": [t for t in (raw.get("terrains") or []) if isinstance(t, dict)],
+            "terrains": terrains,
             "terrain_hidden": terrain_hidden,
             "scene": {"left": left, "top": top, "width": width, "height": height},
         }
+
+    @staticmethod
+    def _map_ref_rect(raw: dict, scene: tuple) -> tuple[float, float, float, float]:
+        """地形归一化坐标的参考矩形：有底图用底图，否则用场景边界。"""
+        bg = raw.get("bg")
+        if isinstance(bg, dict):
+            try:
+                bw = float(bg.get("w") or 0)
+                bh = float(bg.get("h") or 0)
+                cx = float(bg.get("x") or 0)
+                cy = float(bg.get("y") or 0)
+            except (TypeError, ValueError):
+                bw = bh = 0.0
+                cx = cy = 0.0
+            if bw > 1 and bh > 1:
+                return (cx - bw / 2, cy - bh / 2, bw, bh)
+        return (float(scene[0]), float(scene[1]), float(scene[2]), float(scene[3]))
+
+    @staticmethod
+    def _normalize_terrain(raw: dict, ref: tuple, terrain_keys: set) -> dict:
+        """地形路径：优先保留 points；仅有旧版 x/y 时迁移成单点路径，绝不丢标注。"""
+        item = dict(raw)
+        kind = str(item.get("type") or "mountain")
+        item["type"] = kind if kind in terrain_keys else "mountain"
+        points: list[list[float]] = []
+        raw_points = item.get("points")
+        if isinstance(raw_points, list):
+            for pair in raw_points:
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                try:
+                    points.append([round(float(pair[0]), 5), round(float(pair[1]), 5)])
+                except (TypeError, ValueError):
+                    continue
+        if not points:
+            try:
+                x = float(item.get("x") or 0)
+                y = float(item.get("y") or 0)
+                left, top, width, height = ref
+                points = [[round((x - left) / width, 5), round((y - top) / height, 5)]]
+            except (TypeError, ValueError, ZeroDivisionError):
+                points = []
+        item["points"] = points or [[0.5, 0.5]]
+        item.pop("x", None)
+        item.pop("y", None)
+        return item
 
     def load_maps(self) -> list[dict]:
         """读取全部地图；旧版单图结构自动迁移为一张「地图」。"""

@@ -37,6 +37,7 @@ class SidebarWidget(QWidget):
     new_related_requested = Signal()
     edit_related_requested = Signal(str)
     delete_related_requested = Signal(str)
+    snippets_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -145,11 +146,21 @@ class SidebarWidget(QWidget):
         self.related_list.itemDoubleClicked.connect(self._on_related_double_clicked)
         related_layout.addWidget(self.related_list, 1)
 
+        related_buttons = QHBoxLayout()
+        related_buttons.setSpacing(6)
         self.btn_new_related = QPushButton("添加设定", related_page)
         self.btn_new_related.setObjectName("GhostButton")
         self.btn_new_related.setCursor(Qt.PointingHandCursor)
         self.btn_new_related.clicked.connect(self.new_related_requested.emit)
-        related_layout.addWidget(self.btn_new_related)
+        related_buttons.addWidget(self.btn_new_related, 1)
+        self.btn_snippets = QPushButton("文笔仿写", related_page)
+        self.btn_snippets.setObjectName("GhostButton")
+        self.btn_snippets.setCursor(Qt.PointingHandCursor)
+        self.btn_snippets.setCheckable(True)
+        self.btn_snippets.setToolTip("在右侧打开 / 收起文笔仿写片段栏")
+        self.btn_snippets.clicked.connect(self.snippets_requested.emit)
+        related_buttons.addWidget(self.btn_snippets, 1)
+        related_layout.addLayout(related_buttons)
 
         self.pages.addWidget(toc_page)
         self.pages.addWidget(related_page)
