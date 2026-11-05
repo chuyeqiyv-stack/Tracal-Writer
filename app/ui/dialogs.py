@@ -5,12 +5,13 @@ from __future__ import annotations
 import os
 import time
 
-from PySide6.QtCore import QDate, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QDate, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPalette, QPen, QPixmap,
-    QShortcut,
+    QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QPainterPath, QPalette,
+    QPen, QPixmap, QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -38,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import config
-from app.services import name_data
+from app.services import backgrounds, font_store, name_data
 from app.services.search import find_all, line_number_at, line_snippet
 from app.services.word_count import format_word_count
 from app.storage import Storage
@@ -439,6 +440,8 @@ class FontDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._new_fonts: list[str] = []
+        # 之前已导入的数量 + 本次导入，用于标签展示
+        self._imported_count = len(imported or [])
         self._color = str(color or "")
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -586,6 +589,15 @@ class FontDialog(QDialog):
             index = combo.findText(family)
         combo.setCurrentIndex(max(0, index))
 
+    def _add_family_items(self, names: list[str]) -> None:
+        """把新导入的字体族名补进下拉（导入后立即可选，无需重开面板）。"""
+        combo = self.family_combo
+        existing = {combo.itemData(i) for i in range(combo.count())}
+        for name in names:
+            if name and name not in existing:
+                combo.addItem(name, name)
+                existing.add(name)
+
     @staticmethod
     def _cn_presets() -> list[str]:
         presets = ["等线", "仿宋", "黑体", "华文中宋", "楷体", "宋体", "微软雅黑", "隶书", "幼圆"]
@@ -697,19 +709,41 @@ class FontDialog(QDialog):
         paths, _filter = QFileDialog.getOpenFileNames(
             self, "导入字体文件", "", "字体文件 (*.ttf *.otf *.ttc)"
         )
+        self._import_paths(paths)
+
+    def _import_paths(self, paths: list[str]) -> int:
+        """导入给定字体文件（供 UI 与测试共用），返回成功个数。"""
         added = 0
+        new_families: list[str] = []
         for path in paths:
-            font_id = QFontDatabase.addApplicationFont(path)
-            if font_id >= 0:
-                self._new_fonts.append(path)
-                added += 1
+            try:
+                dest, font_id = font_store.register(path)
+            except (OSError, ValueError):
+                continue
+            if font_id < 0:
+                continue
+            self._new_fonts.append(str(dest))
+            added += 1
+            new_families.extend(font_store.family_names(font_id))
         if added:
-            total = len(self._new_fonts)
-            self.imported_label.setText(f"本次导入 {added} 个，会话累计 {total} 个")
+            self._imported_count += added
+            self.imported_label.setText(f"已导入 {self._imported_count} 个本地字体")
+            # 关键：导入后立即补进下拉并选中，让用户点一次就能看到效果
+            self._add_family_items(new_families)
+            if new_families:
+                index = self.family_combo.findData(new_families[0])
+                if index >= 0:
+                    self.family_combo.setCurrentIndex(index)
+                self._emit_live()
             self.fonts_imported.emit(list(self._new_fonts))
-            MessageBox.information(self, "导入成功", f"已加载 {added} 个字体文件，重启后仍会自动加载。")
+            MessageBox.information(
+                self, "导入成功",
+                f"已加载 {added} 个字体文件，并已选中「{new_families[0] if new_families else '新字体'}」。\n"
+                "字体文件已复制到数据目录，重装/重启后仍会自动加载。",
+            )
         else:
             MessageBox.warning(self, "导入失败", "没有可用的字体文件（支持 .ttf / .otf / .ttc）。")
+        return added
 
 
 class LineSpacingDialog(QDialog):
@@ -1585,20 +1619,167 @@ class NameGeneratorDialog(QDialog):
         self.toast.show_message(f"已复制：{name}")
 
 
-class WritingThemeDialog(QDialog):
-    """写作主题面板：网格圆形色块（全部预设）+ 自定义背景图片。"""
+class BackgroundThumb(QAbstractButton):
+    """自定义背景缩略框：与预设色卡同尺寸（78×88），圆角缩略图 cover 裁切。
 
-    theme_applied = Signal(str, str)  # (writing_theme, writing_image)
+    右上角小叉（或右键菜单）删除；文件缺失时画占位框，不崩。
+    """
+
+    delete_requested = Signal(str)   # 文件名
+
+    _SIDE = 50
+    _RADIUS = 12
+
+    def __init__(self, name: str, path: str, label: str,
+                 selected: bool = False, parent=None) -> None:
+        super().__init__(parent)
+        self._name = name
+        self._path = path
+        self._label = label
+        self._pixmap = background_thumb_pixmap(path)
+        self._selected = selected
+        self._hover = False
+        self.setFixedSize(78, 88)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+
+    def name(self) -> str:
+        return self._name
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self.update()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def _delete_rect(self) -> QRect:
+        return QRect(self.width() - 18, 4, 16, 16)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if (event.button() == Qt.LeftButton
+                and self._delete_rect().contains(event.position().toPoint())):
+            self.delete_requested.emit(self._name)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def _menu(self, pos) -> None:
+        menu = QMenu(self)
+        action = menu.addAction("删除此背景")
+        if menu.exec(self.mapToGlobal(pos)) is action:
+            self.delete_requested.emit(self._name)
+
+    def _cover_source(self) -> QRectF:
+        width, height = self._pixmap.width(), self._pixmap.height()
+        side = min(width, height)
+        return QRectF((width - side) / 2, (height - side) / 2, side, side)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        side = self._SIDE if not self._hover else self._SIDE + 2
+        left = (self.width() - side) / 2
+        top = 12 - (side - self._SIDE) / 2
+        rect = QRectF(left, top, side, side)
+
+        if self._selected or self._hover:
+            color = QColor(self.palette().color(QPalette.Highlight))
+            if not self._selected:
+                color.setAlpha(110)
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(-3, -3, 3, 3),
+                                    self._RADIUS + 3, self._RADIUS + 3)
+
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, self._RADIUS, self._RADIUS)
+        painter.save()
+        painter.setClipPath(clip)
+        if self._pixmap.isNull():
+            painter.fillRect(rect, QColor(0, 0, 0, 28))
+            painter.setPen(QPen(QColor(0, 0, 0, 120)))
+            font = QFont(self.font())
+            font.setPixelSize(10)
+            painter.setFont(font)
+            painter.drawText(rect, Qt.AlignCenter, "缺图")
+        else:
+            painter.drawPixmap(rect, self._pixmap, self._cover_source())
+        painter.restore()
+
+        painter.setPen(QPen(QColor(0, 0, 0, 40), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(rect, self._RADIUS, self._RADIUS)
+
+        cross = QRectF(self._delete_rect())
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 190 if self._hover else 110))
+        painter.drawEllipse(cross)
+        painter.setPen(QPen(QColor("#FFFFFF"), 1.6))
+        painter.drawLine(QPointF(cross.left() + 5, cross.top() + 5),
+                         QPointF(cross.right() - 5, cross.bottom() - 5))
+        painter.drawLine(QPointF(cross.right() - 5, cross.top() + 5),
+                         QPointF(cross.left() + 5, cross.bottom() - 5))
+
+        painter.setPen(QPen(QColor(self.palette().color(QPalette.WindowText))))
+        font = QFont(self.font())
+        font.setPixelSize(11)
+        painter.setFont(font)
+        painter.drawText(QRectF(0, 68, self.width(), 18),
+                         Qt.AlignHCenter | Qt.AlignVCenter, self._label)
+        painter.end()
+
+
+_background_thumb_cache: dict[str, QPixmap] = {}
+
+
+def background_thumb_pixmap(path: str) -> QPixmap:
+    """缩略图位图（缓存到 100px，125%/200% 缩放也不糊；按内容寻址文件名天然不变）。"""
+    if not path:
+        return QPixmap()
+    cached = _background_thumb_cache.get(path)
+    if cached is not None:
+        return cached
+    pixmap = QPixmap(path)
+    if pixmap.isNull():
+        pixmap = QPixmap()
+    else:
+        pixmap = pixmap.scaled(
+            100, 100, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+        )
+    if len(_background_thumb_cache) >= 32:
+        _background_thumb_cache.clear()
+    _background_thumb_cache[path] = pixmap
+    return pixmap
+
+
+class WritingThemeDialog(QDialog):
+    """写作主题面板：网格圆形色块（预设）+ 最多 5 个自定义背景缩略框。"""
+
+    theme_applied = Signal(str, str)     # (writing_theme, writing_image)
+    backgrounds_changed = Signal(list)   # 已保存背景文件名列表
 
     COLUMNS = 6  # 每行 6 个圆形色块
 
     def __init__(self, parent, settings) -> None:
         super().__init__(parent)
         self._theme = settings.writing_theme
+        if self._theme != "custom" and self._theme not in WRITING_THEMES:
+            self._theme = "auto"   # 旧配置指向已删除的预设 → 面板选中「跟随主题」
         self._image = settings.writing_image
+        self._backgrounds = [name for name in (settings.backgrounds or []) if name]
         self.setWindowTitle("写作主题")
         self.setModal(True)
-        self.resize(560, 520)
+        self.resize(560, 560)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 18)
@@ -1614,6 +1795,7 @@ class WritingThemeDialog(QDialog):
         grid.setHorizontalSpacing(4)
         grid.setVerticalSpacing(8)
         self._swatches: list[CircleSwatch] = []
+        self._swatch_map: dict[str, CircleSwatch] = {}
         for index, key in enumerate(WRITING_THEMES.keys()):
             info = WRITING_THEMES[key]
             color = info["bg"] or ("#F2F3F5" if key == "auto" else "#FFFFFF")
@@ -1622,23 +1804,36 @@ class WritingThemeDialog(QDialog):
             row, col = divmod(index, self.COLUMNS)
             grid.addWidget(swatch, row, col, Qt.AlignHCenter)
             self._swatches.append(swatch)
+            self._swatch_map[key] = swatch
         for col in range(self.COLUMNS):
             grid.setColumnStretch(col, 1)
         layout.addLayout(grid)
 
-        image_row = QHBoxLayout()
-        self.image_label = QLabel(
-            self._image if self._image else "未使用自定义图片背景", self
-        )
-        self.image_label.setObjectName("DrawerHint")
+        # 我的背景：标题 + 计数 + 上传入口，下方是缩略框行
+        head = QHBoxLayout()
+        caption = QLabel("我的背景", self)
+        caption.setObjectName("DrawerHint")
+        self._count_label = QLabel("", self)
+        self._count_label.setObjectName("DrawerHint")
         self.image_button = _ghost("上传自定义图片…", self)
         self.image_button.clicked.connect(self._pick_image)
-        image_row.addWidget(self.image_label, 1)
-        image_row.addWidget(self.image_button)
-        layout.addLayout(image_row)
+        head.addWidget(caption)
+        head.addWidget(self._count_label)
+        head.addStretch(1)
+        head.addWidget(self.image_button)
+        layout.addLayout(head)
+
+        self._thumb_host = QWidget(self)
+        self._thumb_row = QHBoxLayout(self._thumb_host)
+        self._thumb_row.setContentsMargins(0, 0, 0, 0)
+        self._thumb_row.setSpacing(4)
+        layout.addWidget(self._thumb_host)
+        self._thumbs: list[BackgroundThumb] = []
+        self._rebuild_thumbs()
 
         _add_buttons(self, layout, "完成", self.accept)
 
+    # ------------------------------------------------------------------
     def _apply(self, key: str) -> None:
         self._theme = key
         for swatch in self._swatches:
@@ -1646,20 +1841,98 @@ class WritingThemeDialog(QDialog):
         sender = self.sender()
         if isinstance(sender, CircleSwatch):
             sender.set_selected(True)
+        for thumb in self._thumbs:
+            thumb.set_selected(False)
+        self.theme_applied.emit(self._theme, self._image)
+
+    def _rebuild_thumbs(self) -> None:
+        while self._thumb_row.count():
+            item = self._thumb_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._thumbs = []
+        for index, name in enumerate(self._backgrounds):
+            thumb = BackgroundThumb(
+                name, backgrounds.resolve(name), f"背景 {index + 1}",
+                name == self._image, self._thumb_host,
+            )
+            thumb.clicked.connect(lambda _c=False, n=name: self._select_background(n))
+            thumb.delete_requested.connect(self._delete_background)
+            self._thumb_row.addWidget(thumb)
+            self._thumbs.append(thumb)
+        self._thumb_row.addStretch(1)
+        self._count_label.setText(
+            f"{len(self._backgrounds)}/{backgrounds.MAX_BACKGROUNDS}"
+        )
+
+    def _select_background(self, name: str) -> None:
+        if not backgrounds.resolve(name):
+            MessageBox.warning(self, "图片缺失", "这张背景图片已丢失，请删除后重新上传。")
+            return
+        self._image = name
+        self._theme = "custom"
+        for swatch in self._swatches:
+            swatch.set_selected(False)
+        for thumb in self._thumbs:
+            thumb.set_selected(thumb.name() == name)
+        self.theme_applied.emit(self._theme, self._image)
+
+    def _delete_background(self, name: str) -> None:
+        if name not in self._backgrounds:
+            return
+        path = backgrounds.resolve(name)
+        self._backgrounds.remove(name)
+        backgrounds.delete(name)
+        if path:
+            _background_thumb_cache.pop(path, None)
+        if self._image == name:
+            # 正在用的那张被删 → 回落默认背景（跟随主题）
+            self._image = ""
+            self._theme = "auto"
+        self._rebuild_thumbs()
+        for swatch in self._swatches:
+            swatch.set_selected(False)
+        if self._theme == "auto":
+            self._swatch_map["auto"].set_selected(True)
+        elif self._theme == "custom":
+            for thumb in self._thumbs:
+                thumb.set_selected(thumb.name() == self._image)
+        else:
+            swatch = self._swatch_map.get(self._theme)
+            if swatch is not None:
+                swatch.set_selected(True)
+        self.backgrounds_changed.emit(list(self._backgrounds))
         self.theme_applied.emit(self._theme, self._image)
 
     def _pick_image(self) -> None:
+        if len(self._backgrounds) >= backgrounds.MAX_BACKGROUNDS:
+            MessageBox.warning(
+                self, "最多 5 张背景", "最多保存 5 张背景，请先删一张。"
+            )
+            return
         path, _filter = QFileDialog.getOpenFileName(
             self, "选择背景图片", "", "图片文件 (*.png *.jpg *.jpeg *.webp *.bmp)"
         )
         if not path:
             return
-        self._image = path
+        try:
+            name = backgrounds.import_image(path)
+        except (OSError, ValueError):
+            MessageBox.warning(self, "导入失败", "无法读取这张图片，请换一张试试。")
+            return
+        self._backgrounds.append(name)
+        self._image = name
         self._theme = "custom"
-        self.image_label.setText(path)
+        self._rebuild_thumbs()
         for swatch in self._swatches:
             swatch.set_selected(False)
+        self.backgrounds_changed.emit(list(self._backgrounds))
         self.theme_applied.emit(self._theme, self._image)
+
+    def backgrounds(self) -> list[str]:
+        return list(self._backgrounds)
 
     def values(self) -> tuple[str, str]:
         return self._theme, self._image

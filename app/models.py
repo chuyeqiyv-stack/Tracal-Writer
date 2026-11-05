@@ -71,8 +71,11 @@ class Settings:
     statusbar_text: str = ""
     editor_bg: str = ""                 # 手动覆盖写作区背景
     editor_text: str = ""
-    writing_theme: str = "auto"         # auto / white / green / parchment / starry / black / custom
-    writing_image: str = ""             # 自定义写作区背景图片（绝对路径）
+    writing_theme: str = "auto"         # auto / white / green / lilac / sakura / skyblue / cream / starry / custom
+    # 自定义写作区背景：当前选中的文件名（位于 <数据目录>/backgrounds；旧版存绝对路径，启动时迁移）
+    writing_image: str = ""
+    # 已保存的自定义背景（文件名列表，顺序即面板显示顺序，最多 5 个）
+    backgrounds: list[str] = field(default_factory=list)
 
     # 排版
     indent: str = "two"                 # two 两个字符缩进 / none 无缩进
@@ -83,6 +86,7 @@ class Settings:
 
     # 输入
     auto_pair: bool = True              # 成对标点自动补全
+    tab_cjk_indent: bool = False        # Tab 插入两个全角空格（中文缩进，默认关）
 
     # 字数
     exclude_punct: bool = False         # 字数统计不计标点
@@ -180,10 +184,16 @@ class Settings:
 
         if result.mode not in {"light", "dark"}:
             result.mode = "light"
-        # writing_theme 的合法键集合由 theme.WRITING_THEMES 决定，
-        # 这里不做严格校验，未知键在使用处会自动回退为跟随主题。
         if not result.writing_theme:
             result.writing_theme = "auto"
+        elif result.writing_theme != "custom":
+            # 预设色卡可能被精简：旧配置里已删除的键映射回「跟随主题」，不报错
+            try:
+                from app.ui.theme import WRITING_THEMES
+            except ImportError:
+                WRITING_THEMES = {}
+            if WRITING_THEMES and result.writing_theme not in WRITING_THEMES:
+                result.writing_theme = "auto"
         if result.shelf_view not in {"grid", "list"}:
             result.shelf_view = "grid"
         if result.character_view not in {"list", "board"}:

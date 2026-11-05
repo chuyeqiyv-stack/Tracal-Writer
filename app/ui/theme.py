@@ -99,16 +99,7 @@ WRITING_THEMES: dict[str, dict[str, str]] = {
     "sakura":     {"name": "樱粉",     "bg": "#FBEAEE", "text": "#54333D"},
     "skyblue":    {"name": "浅蓝",     "bg": "#E7F0FA", "text": "#2C3E52"},
     "cream":      {"name": "淡黄",     "bg": "#FBF3DC", "text": "#4C442B"},
-    "oldgold":    {"name": "古黄",     "bg": "#E8D5A3", "text": "#4A3A1C"},
-    "yellowrock": {"name": "黄石纹",   "bg": "#D9C48E", "text": "#42351A"},
-    "parchment1": {"name": "羊皮纸1",  "bg": "#F1E4C3", "text": "#4A3926"},
-    "parchment2": {"name": "羊皮纸2",  "bg": "#E6D3AC", "text": "#43331E"},
-    "stripe":     {"name": "条纹",     "bg": "#EEF0E4", "text": "#3C4033"},
     "starry":     {"name": "星空蓝",   "bg": "#1B2340", "text": "#DCE4FF"},
-    "blueblack":  {"name": "蓝黑",     "bg": "#14181F", "text": "#C7D3E3"},
-    "drunkblack": {"name": "醉黑",     "bg": "#1A1418", "text": "#D8CBD3"},
-    "frosted":    {"name": "磨砂黑",   "bg": "#232323", "text": "#DADADA"},
-    "frostwhite": {"name": "磨砂白",   "bg": "#F2F3F1", "text": "#3A3D3A"},
 }
 
 # 书籍默认封面底纹（渐变）

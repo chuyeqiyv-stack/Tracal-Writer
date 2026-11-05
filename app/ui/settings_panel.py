@@ -322,6 +322,8 @@ class SettingsDrawer(QDialog):
         self._add_switch(section, "clean_spaces", "清除多余空格", "智能排版时清理行尾空格与标点旁的空格。")
         self._add_switch(section, "unify_punct", "半角标点转全角", "智能排版时把中文段落里的半角标点统一为全角。")
         self._add_switch(section, "ellipsis_fix", "规范省略号破折号", "智能排版时把「。。。」「---」规范为「……」「——」。")
+        self._add_switch(section, "tab_cjk_indent", "Tab 插入中文缩进",
+                         "按 Tab 插入两个全角空格；关闭时保持制表符。")
 
         # 输入设置
         section = self._add_section("输入设置")

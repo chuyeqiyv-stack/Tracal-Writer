@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QActionGroup, QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -191,6 +191,7 @@ class MainWindow(QMainWindow):
         self._snippets_visible = False
         self._snippets_panel: SnippetsPanel | None = None
         self._load_imported_fonts()
+        self._load_backgrounds()
 
         self._find_dialog: FindReplaceDialog | None = None
         self._search_dialog: GlobalSearchDialog | None = None
@@ -213,6 +214,8 @@ class MainWindow(QMainWindow):
         startup_trace.mark("mw_theme")
         self.show_bookshelf()
         startup_trace.mark("mw_shelf")
+        # 启动自检：只在发现异常时写 logs/editor_health.log，正常启动零噪音
+        QTimer.singleShot(0, lambda: self._selfcheck_editor("startup"))
         # 任务G：封面懒迁移/孤儿扫描延后到首帧之后（不压构造耗时）；有变更再刷书架
         QTimer.singleShot(0, self._housekeep_covers_deferred)
         startup_trace.dump("mainwindow")
@@ -235,14 +238,20 @@ class MainWindow(QMainWindow):
     # 字体导入
     # ==================================================================
     def _load_imported_fonts(self) -> None:
-        """启动时加载用户导入过的本地字体文件。"""
-        from PySide6.QtGui import QFontDatabase
+        """启动时重新注册用户导入过的字体（顺带把旧绝对路径迁进数据目录）。"""
+        from app.services import font_store
 
-        for path in list(self.settings.imported_fonts):
-            if path and os.path.exists(path):
-                QFontDatabase.addApplicationFont(path)
-            else:
-                self.settings.imported_fonts.remove(path)
+        kept = font_store.load_all(self.settings.imported_fonts)
+        if kept != list(self.settings.imported_fonts):
+            self.settings.imported_fonts = kept
+            self.storage.save_settings(self.settings)
+
+    def _load_backgrounds(self) -> None:
+        """启动时整理自定义背景：旧版单张绝对路径迁成 1 个框，清理缺失文件。"""
+        from app.services import backgrounds
+
+        if backgrounds.migrate(self.settings):
+            self.storage.save_settings(self.settings)
 
     # ==================================================================
     # 界面搭建
@@ -633,6 +642,8 @@ class MainWindow(QMainWindow):
             lambda: (
                 self.buttons["settings"].setChecked(False),
                 self.home_buttons["settings"].setChecked(False),
+                # 关闭设置后焦点直接还给正文：用户不需要“先点一下”才能打字
+                self._refocus_editor_after_drawer(),
             )
         )
 
@@ -1440,12 +1451,12 @@ class MainWindow(QMainWindow):
             self.settings.font_bold = bold
             self.settings.font_italic = italic
             self.settings.font_underline = underline
-            if (color != old[2] or family != old[0] or float(size) != float(old[1])):
-                # 颜色与字体/字号都走全局 QSS（QSS 优先级高于程序字体，
-                # 只调 editor.setFont 会被全局 QWidget 规则覆盖），必须整体刷新
+            if color != old[2]:
+                # 颜色走全局 QSS（QSS 优先级高于程序字体），必须整体刷新
                 self.apply_theme()
             else:
-                # 仅粗体/斜体/下划线变化：编辑器内即可生效
+                # 字体 / 字号 / 粗斜下划线只影响正文：直接套用，避免整窗 QSS 重建
+                # （整窗刷新约 0.8s，实时预览会明显卡顿）
                 self.editor_page.apply_settings(self.settings)
 
         dialog.live_changed.connect(_live)
@@ -1453,14 +1464,18 @@ class MainWindow(QMainWindow):
             (self.settings.font_family, self.settings.font_size, self.settings.editor_text,
              self.settings.font_bold, self.settings.font_italic, self.settings.font_underline
              ) = dialog.values()
-            self.storage.save_settings(self.settings)
-            self.apply_theme()
         else:
             # 取消：还原为打开前的字体
             (self.settings.font_family, self.settings.font_size, self.settings.editor_text,
              self.settings.font_bold, self.settings.font_italic, self.settings.font_underline
              ) = old
+        self.storage.save_settings(self.settings)
+        if self.settings.editor_text != old[2]:
+            # 正文颜色走全局 QSS，必须整体刷新（全窗重建约 0.8s）
             self.apply_theme()
+        else:
+            # 字体 / 字号 / 粗斜下划线只影响正文：局部套用，关窗不卡顿
+            self.editor_page.apply_settings(self.settings)
 
     def _on_fonts_imported(self, paths: list[str]) -> None:
         known = set(self.settings.imported_fonts)
@@ -1497,19 +1512,31 @@ class MainWindow(QMainWindow):
         """写作主题面板：圆形色块实时切换写作区背景。"""
         dialog = WritingThemeDialog(self, self.settings)
         dialog.theme_applied.connect(self._on_writing_theme)
+        dialog.backgrounds_changed.connect(self._on_backgrounds_changed)
         dialog.exec()
         theme_key, image = dialog.values()
         self.settings.writing_theme = theme_key
         self.settings.writing_image = image
+        self.settings.backgrounds = dialog.backgrounds()
         self.storage.save_settings(self.settings)
         self.apply_theme()
 
     def _on_writing_theme(self, theme_key: str, image: str) -> None:
         """面板内点击色块时实时应用。"""
+        previous = self.settings.writing_theme
         self.settings.writing_theme = theme_key
         self.settings.writing_image = image
         self.storage.save_settings(self.settings)
+        if theme_key == "custom" and image and previous == "custom":
+            # 自定义图片之间切换：只需换纸张背景，不必重建全局 QSS
+            self.editor_page.apply_writing_background()
+            return
         self.apply_theme()
+
+    def _on_backgrounds_changed(self, names: list) -> None:
+        """面板里上传/删除背景后立即落盘（原子写），崩溃也不丢列表。"""
+        self.settings.backgrounds = [str(name) for name in names]
+        self.storage.save_settings(self.settings)
 
     def show_name_dialog(self) -> None:
         # 复用同一实例：候选、选中名字与各分类筛选条件跨打开保留
@@ -2368,6 +2395,7 @@ class MainWindow(QMainWindow):
         cover_cache_clear()
         self.settings = self.storage.load_settings()
         self._load_imported_fonts()
+        self._load_backgrounds()
         if self._snippets_panel is not None:
             self._snippets_panel.reload()
         if self._snippets_visible:
@@ -2393,6 +2421,65 @@ class MainWindow(QMainWindow):
 
     def toggle_drawer(self) -> None:
         self.drawer.toggle()
+
+    # ==================================================================
+    # 正文可编辑自检（“点不进 / 输不进”的兜底与取证）
+    # ==================================================================
+    def focusInEvent(self, event) -> None:  # noqa: N802
+        super().focusInEvent(event)
+        self._selfcheck_editor("focus_in")
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._selfcheck_editor("activate")
+        super().changeEvent(event)
+
+    def _refocus_editor_after_drawer(self) -> None:
+        """设置关闭后焦点交还正文（不必再点一次才能输入）。"""
+        if not self.current_chapter_id or self.stack.currentIndex() != 1:
+            return
+        if not self.editor_page.isVisible():
+            return
+        self.editor_page.unlock_editor()
+        self.editor_page.focus_editor()
+
+    def _clear_stuck_dim_overlay(self) -> list[str]:
+        """设置已不可见、遮罩却还盖着主窗口：撤掉它并复位按钮勾选态。"""
+        drawer = getattr(self, "drawer", None)
+        overlay = getattr(drawer, "_overlay", None) if drawer is not None else None
+        if overlay is None or not overlay.isVisible() or drawer.isVisible():
+            return []
+        drawer._is_open = False
+        overlay.hide()
+        for group in (getattr(self, "buttons", {}), getattr(self, "home_buttons", {})):
+            btn = group.get("settings")
+            if btn is not None:
+                btn.setChecked(False)
+        return ["dim_overlay_stale"]
+
+    def _selfcheck_editor(self, reason: str) -> None:
+        """轻量自检：正常状态下只读几个标志位，不做任何重活。"""
+        started = time.perf_counter()
+        fixed: list[str] = []
+        page = getattr(self, "editor_page", None)
+        if page is not None and self.current_chapter_id and page.isVisible():
+            fixed += page.unlock_editor()
+        fixed += self._clear_stuck_dim_overlay()
+        self._selfcheck_cost_us = int((time.perf_counter() - started) * 1e6)
+        if fixed:
+            self._log_anomaly(
+                f"editor_selfcheck[{reason}] fixed={fixed} cost={self._selfcheck_cost_us}us"
+            )
+
+    def _log_anomaly(self, line: str) -> None:
+        """异常才写盘：数据目录 logs/editor_health.log（正常启动不产生噪音）。"""
+        try:
+            log_dir = Path(self.storage.base_dir) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "editor_health.log", "a", encoding="utf-8") as fp:
+                fp.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+        except OSError:
+            pass
 
     # ==================================================================
     # 文笔仿写片段栏（右侧，可拖拽宽度）
