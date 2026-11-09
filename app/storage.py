@@ -26,6 +26,38 @@ from app import config
 from app.models import Book, Settings, new_id
 
 
+# v1.4.4：旧版默认正文排版。已存配置四项全部等于这组值时，视为“用户从未自定义”，
+# 一次性迁移到新默认（12pt / 1.55em / 段前段后各 0.5 行）；任何一项不等则保留原值。
+LEGACY_TYPOGRAPHY_DEFAULTS = {
+    "font_size": 16.0,
+    "line_spacing": 1.1,
+    "para_space_before": 0.0,
+    "para_space_after": 0.0,
+}
+TYPOGRAPHY_MIGRATION_DEFAULTS = {
+    "font_size": 12.0,
+    "line_spacing": 1.55,
+    "para_space_before": 0.5,
+    "para_space_after": 0.5,
+}
+
+
+def legacy_typography_matches(raw: Any) -> bool:
+    """旧配置是否仍完整停留在旧默认排版上（失败/缺键/类型异常一律视为“自定义”）。"""
+    if not isinstance(raw, dict):
+        return False
+    for key, old_value in LEGACY_TYPOGRAPHY_DEFAULTS.items():
+        if key not in raw:
+            return False
+        try:
+            value = float(raw[key])
+        except (TypeError, ValueError):
+            return False
+        if abs(value - old_value) > 1e-6:
+            return False
+    return True
+
+
 class ImportReport(dict):
     """角色导入报告：支持字典取值，同时兼容旧调用方的双值解包。"""
 
@@ -107,7 +139,40 @@ class Storage:
     # 设置
     # ------------------------------------------------------------------
     def load_settings(self) -> Settings:
+        # v1.4.4：首次读取旧配置时做一次性排版迁移（失败/异常就跳过，绝不阻断启动）
+        try:
+            if self._migrate_legacy_typography():
+                return Settings.from_dict(self._read_json(self.settings_file, {}))
+        except Exception:   # noqa: BLE001 - 迁移属附加动作，绝不能影响启动
+            pass
         return Settings.from_dict(self._read_json(self.settings_file, {}))
+
+    def _migrate_legacy_typography(self) -> bool:
+        """把“仍停留在旧默认排版”的配置迁到新默认；迁移前备份 settings.json。
+
+        可重入：迁移后四项已不等于旧默认，第二次读取不会再写盘；备份只建一次，
+        不会用迁移后的文件覆盖掉原始备份。
+        """
+        path = self.settings_file
+        backup = path.with_name(path.name + ".bak_v144")
+        try:
+            if not path.exists():
+                return False
+            with path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if not legacy_typography_matches(raw):
+            return False
+        try:
+            if not backup.exists():
+                shutil.copy2(path, backup)
+            migrated = dict(raw)
+            migrated.update(TYPOGRAPHY_MIGRATION_DEFAULTS)
+            self._write_json(path, migrated)
+        except OSError:
+            return False
+        return True
 
     def save_settings(self, settings: Settings) -> None:
         self._write_json(self.settings_file, settings.to_dict())
@@ -1454,7 +1519,7 @@ class Storage:
         chars: int = 0,
         cap: int | None = None,
     ) -> None:
-        """保存一个历史快照，并把整本书的历史版本裁剪到上限（默认 config.MAX_SNAPSHOTS）。"""
+        """保存一个历史快照，并按「每章份数 + 单本书总字节」双上限淘汰最旧。"""
         folder = self._snapshot_dir(book_id, chapter_id)
         folder.mkdir(parents=True, exist_ok=True)
         ts = time.time()
@@ -1463,21 +1528,44 @@ class Storage:
             folder / name,
             {"time": ts, "content": content, "chars": chars, "id": new_id()},
         )
-        self.trim_snapshots(book_id, cap if cap is not None else config.MAX_SNAPSHOTS)
+        self.trim_snapshots(
+            book_id,
+            cap if cap is not None else config.MAX_SNAPSHOTS,
+            config.HISTORY_MAX_BYTES,
+        )
 
-    def trim_snapshots(self, book_id: str, cap: int) -> None:
-        """把一本书全部章节的历史快照裁剪到最近 cap 个（按时间从旧到新删除）。"""
+    def trim_snapshots(self, book_id: str, cap: int, max_bytes: int | None = None) -> None:
+        """清理历史快照：每章只保留最近 cap 个；整本书总字节超限时按最旧淘汰。"""
         root = self.history_dir / book_id
         if not root.exists():
             return
-        files = sorted(root.glob("*/*.json"))
-        limit = max(0, int(cap))
-        excess = len(files) - limit
-        for old in files[: max(0, excess)]:
+        limit = max(1, int(cap))
+        for folder in root.iterdir():
+            if not folder.is_dir():
+                continue
+            files = sorted(folder.glob("*.json"), reverse=True)
+            for old in files[limit:]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        if max_bytes is None or int(max_bytes) <= 0:
+            return
+        limit_bytes = int(max_bytes)
+        running = 0
+        for path in sorted(root.glob("*/*.json"), reverse=True):
             try:
-                old.unlink()
+                size = path.stat().st_size
             except OSError:
-                pass
+                continue
+            running += size
+            if running <= limit_bytes:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            running -= size
 
     def list_snapshots(self, book_id: str, chapter_id: str) -> list[dict]:
         """按时间倒序返回快照列表。"""

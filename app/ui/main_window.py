@@ -11,17 +11,25 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QActionGroup, QCursor, QKeySequence, QShortcut
+from PySide6.QtCore import (
+    QEasingCurve, QEvent, QPropertyAnimation, QRectF, QSize, QStandardPaths, Qt, QThread, QTimer, Signal,
+)
+from PySide6.QtGui import (
+    QActionGroup, QColor, QCursor, QKeySequence, QPainter, QPen, QShortcut,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -29,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app import config, startup_trace
+from app import config, exporter, startup_trace
 from app.models import Book, Chapter, RelatedItem, Settings, Volume, create_book, new_id, next_chapter_title
 from app.services import formatter
 from app.services.achievements import (
@@ -39,6 +47,7 @@ from app.services.achievements import (
     ACHIEVEMENTS,
 )
 from app.services.stats import WritingSpeedTracker
+from app.services.sounds import play_manual_save_sound, play_wav
 from app.services.webdav_sync import (
     WebDavError,
     create_remote_dir,
@@ -64,20 +73,27 @@ from app.ui.dialogs import (
     NewBookDialog,
     NoteEditorWindow,
     ParagraphDialog,
+    ProofreadDialog,
     RelatedDialog,
     StatsDialog,
     WritingThemeDialog,
 )
-from app.ui.editor import EditorPage
+from app.ui.editor import EditorPage, SaveSpinner
 from app.ui.icons import IconFactory
 from app.ui.map import MapDialog
 from app.ui.outline import OutlineDialog
 from app.ui.settings_panel import SettingsDrawer
 from app.ui.sidebar import SidebarWidget
+from app.ui.volume_export import MODE_BOOK, VolumeExportDialog
 from app.ui.snippets import SnippetsPanel
 from app.ui.theme import base_theme, build_palette, build_qss, build_theme
 from app.ui.timeline import TimelineDialog
 from app.ui.widgets import BackgroundWidget, ToolbarButton
+
+
+# 关窗时仍未结束的后台同步线程：脱离主窗口后在此保活，
+# 避免 QThread 在运行中被主窗口连带析构
+_ORPHAN_WORKERS: list[QThread] = []
 
 
 class WebDavWorker(QThread):
@@ -159,6 +175,184 @@ class WebDavCreateDirWorker(QThread):
             self.failed.emit(f"创建目录失败：{exc}")
 
 
+class ExitSaveOverlay(QWidget):
+    """关窗时的居中保存浮层：圆环旋转 → 绿勾 → 淡出，失败则停留让用户决定。
+
+    覆盖在主窗口上，只负责展示与按钮，保存动作全部由 MainWindow 复用原
+    closeEvent 的 flush 路径完成；本类不碰数据、不起线程。
+    """
+
+    retry_requested = Signal()
+    cancel_requested = Signal()
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("ExitSaveOverlay")
+        self.setAttribute(Qt.WA_StyledBackground, False)
+
+        self._card = QFrame(self)
+        self._card.setObjectName("MessageBox")   # 沿用现有底板 / 玻璃质感
+        self._card.setFixedWidth(380)
+
+        card_layout = QVBoxLayout(self._card)
+        card_layout.setContentsMargins(24, 20, 24, 18)
+        card_layout.setSpacing(10)
+
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        self.spinner = SaveSpinner(self._card)
+        row.addWidget(self.spinner, 0, Qt.AlignVCenter)
+        text_box = QVBoxLayout()
+        text_box.setSpacing(3)
+        self.title = QLabel("正在保存…", self._card)
+        self.title.setObjectName("MsgTitle")
+        self.detail = QLabel("正在把未保存的内容写入本地…", self._card)
+        self.detail.setObjectName("MsgText")
+        self.detail.setWordWrap(True)
+        text_box.addWidget(self.title)
+        text_box.addWidget(self.detail)
+        row.addLayout(text_box, 1)
+        card_layout.addLayout(row)
+
+        self._buttons = QWidget(self._card)
+        button_row = QHBoxLayout(self._buttons)
+        button_row.setContentsMargins(0, 4, 0, 0)
+        button_row.setSpacing(10)
+        button_row.addStretch(1)
+        self.retry_button = QPushButton("重试保存", self._buttons)
+        self.retry_button.setObjectName("Primary")
+        self.retry_button.setCursor(Qt.PointingHandCursor)
+        self.retry_button.clicked.connect(self.retry_requested.emit)
+        self.cancel_button = QPushButton("取消退出", self._buttons)
+        self.cancel_button.setObjectName("GhostButton")
+        self.cancel_button.setCursor(Qt.PointingHandCursor)
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        button_row.addWidget(self.cancel_button)
+        button_row.addWidget(self.retry_button)
+        self._buttons.hide()
+        card_layout.addWidget(self._buttons)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addStretch(1)
+        outer.addWidget(self._card, 0, Qt.AlignHCenter)
+        outer.addStretch(1)
+
+        self._effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._effect)
+        self._fade = QPropertyAnimation(self._effect, b"opacity", self)
+        self._fade.setDuration(220)
+        self._fade.setEasingCurve(QEasingCurve.InOutQuad)
+        self.hide()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self.parentWidget() is not None:
+            self.setGeometry(self.parentWidget().rect())
+
+    def show_saving(self) -> None:
+        self._fade.stop()
+        self._effect.setOpacity(1.0)
+        self.spinner.start_saving()
+        self.title.setText("正在保存…")
+        self.detail.setText("正在把未保存的内容写入本地…")
+        self._buttons.hide()
+        self._show()
+
+    def show_success(self) -> None:
+        self.spinner.set_state(SaveSpinner.OK, 0)   # 常驻绿勾，由外部计时淡出
+        self.title.setText("已保存")
+        self.detail.setText("内容已安全写入本地，即将关闭。")
+        self._buttons.hide()
+
+    def show_error(self, reason: str) -> None:
+        brief = (reason or "未知原因").splitlines()[0][:160]
+        self.spinner.set_state(SaveSpinner.ERROR, 0)
+        self.title.setText("保存失败")
+        self.detail.setText(f"{brief}\n内容仍保留在编辑器中，可重试保存或取消退出。")
+        self._buttons.show()
+        self._show()
+
+    def hide_overlay(self) -> None:
+        self._fade.stop()
+        self.hide()
+
+    def fade_out(self, done) -> None:
+        self._fade.stop()
+        self._fade.setStartValue(self._effect.opacity())
+        self._fade.setEndValue(0.0)
+        self._fade.finished.connect(done)
+        self._fade.start()
+
+    def _show(self) -> None:
+        if self.parentWidget() is not None:
+            self.setGeometry(self.parentWidget().rect())
+        self.show()
+        self.raise_()
+
+
+class TopbarReveal(QWidget):
+    """顶栏收起后的恢复入口：贴在窗口上沿中央的细条。
+
+    静止时只画一根很短的小握把，不占底色、不留横条；鼠标移上来才展开成
+    “展开顶部栏”的胶囊按钮，保证“进得去也出得来”。
+    """
+
+    clicked = Signal()
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setFixedSize(170, 18)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("点击展开顶部栏")
+        self.setAccessibleName("展开顶部栏")
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._hover = False
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        full = QRectF(self.rect())
+        pal = self.palette()
+        if self._hover:
+            bg = QColor(pal.window().color())
+            bg.setAlpha(240)
+            border = QColor(pal.mid().color())
+            border.setAlpha(160)
+            painter.setPen(QPen(border, 1))
+            painter.setBrush(bg)
+            painter.drawRoundedRect(full.adjusted(0.5, 0.5, -0.5, -0.5), 9, 9)
+            fg = QColor(pal.windowText().color())
+            fg.setAlpha(230)
+            painter.setPen(fg)
+            font = self.font()
+            font.setPixelSize(11)
+            painter.setFont(font)
+            painter.drawText(full, Qt.AlignCenter, "展开顶部栏 ▾")
+        else:
+            grip = QColor(pal.windowText().color())
+            grip.setAlpha(70)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(grip)
+            painter.drawRoundedRect(QRectF((self.width() - 26) / 2, 2, 26, 3), 1.5, 1.5)
+
+
 class MainWindow(QMainWindow):
     """应用主窗口。"""
 
@@ -176,10 +370,15 @@ class MainWindow(QMainWindow):
         self._other_chars = 0
         self._total_chars = 0
         self._dirty = False
+        self._last_save_error = ""       # 最近一次真实落盘失败原因（圆环红叉 / 退出浮层用）
+        self._exit_overlay = None
+        self._close_flow_active = False
+        self._close_from_flow = False
         self.speed = WritingSpeedTracker()
         self.achievements = AchievementManager(storage)
         self._words_pending = 0          # 尚未落盘的今日键盘打字字数
-        self._last_auto_snapshot = 0.0   # 上一次自动快照时间（去重用）
+        self._snapshot_marks: dict[str, tuple[float, int]] = {}   # 每章上一版快照的(时间, 字数)
+        self._chapter_order_undo: list[list[tuple[str, list[str]]]] = []   # 目录拖动排序撤销栈
         self._webdav_worker: WebDavWorker | None = None
         self._webdav_test_worker: WebDavTestWorker | None = None
         self._webdav_create_worker: WebDavCreateDirWorker | None = None
@@ -195,6 +394,10 @@ class MainWindow(QMainWindow):
 
         self._find_dialog: FindReplaceDialog | None = None
         self._search_dialog: GlobalSearchDialog | None = None
+        self._proofread_dialog: ProofreadDialog | None = None
+        self._focus_mode = False
+        self._focus_snapshot: dict | None = None
+        self._topbar_compact: bool | None = None
         self._name_dialog: NameGeneratorDialog | None = None
 
         self.setWindowTitle(config.APP_NAME)
@@ -286,7 +489,15 @@ class MainWindow(QMainWindow):
         # 片段栏按需创建：首次展开时才构造面板并读取 snippets.json，
         # 避免每次启动都为未展开的面板付出构造 / 解析成本。
         workspace_layout.addWidget(self.sidebar)
-        workspace_layout.addWidget(self._build_side_toggle())
+        # v1.4.4：目录收起细条不进布局，改为浮在写作区左缘的覆盖层。
+        # 这样左栏收起时纸张可以真正贴到窗口左边缘，细条仍可点击恢复。
+        self.side_toggle_bar = self._build_side_toggle()
+        self.side_toggle_bar.setParent(self.workspace)
+        self.side_toggle_bar.raise_()
+        # 侧栏展开时给细条预留 16px；收起时归零，让纸张真正贴窗口左缘
+        self.side_toggle_spacer = QWidget(self.workspace)
+        self.side_toggle_spacer.setFixedWidth(16)
+        workspace_layout.addWidget(self.side_toggle_spacer)
         # 正文与右侧片段栏：可拖拽分栏；片段栏收起时正文自动占满
         self.editor_split = QSplitter(Qt.Horizontal, self.workspace)
         self.editor_split.setObjectName("EditorSplit")
@@ -303,6 +514,11 @@ class MainWindow(QMainWindow):
         self.top_stack.addWidget(self.topbar)
         root_layout.addWidget(self.top_stack)
         root_layout.addWidget(self.stack, 1)
+
+        # 顶栏收起后的恢复细条：浮在窗口上沿中央（不进布局，绝不额外占高度）
+        self.top_reveal = TopbarReveal(self.root)
+        self.top_reveal.clicked.connect(lambda: self._set_topbar_collapsed(False))
+        self.top_reveal.hide()
 
         self.drawer = SettingsDrawer(self.settings, self)
         startup_trace.mark("ui_drawer")
@@ -361,7 +577,7 @@ class MainWindow(QMainWindow):
     def _update_side_toggle_arrow(self) -> None:
         """根据目录显隐切换箭头方向与提示。"""
         factory = getattr(self, "_icon_factory", None)
-        visible = self.sidebar.isVisible()
+        visible = not self.sidebar.isHidden()
         if factory is not None:
             self.side_toggle_button.setIcon(factory.icon("left" if visible else "right", 14))
         self.side_toggle_button.setToolTip("收起目录" if visible else "展开目录")
@@ -454,13 +670,21 @@ class MainWindow(QMainWindow):
         add("count", "统计", "count", "字数统计", self.show_stats_dialog)
         add("speed", "时速", "speed", "码字时速", self.show_speed_dialog)
         add("name", "起名", "name", "起名助手", self.show_name_dialog)
+        add("proofread", "体检", "proofread", "文本体检 Ctrl+Shift+K",
+            self.show_proofread_dialog)
+        focus_button = add("focus", "专注", "focus", "专注模式 F11",
+                           self.toggle_focus_mode)
+        focus_button.setCheckable(True)
         more = add("settings", "设置", "settings", "更多设置", self.toggle_drawer)
         more.setCheckable(True)
+        # 顶栏收起：收起后纸张上沿贴住窗口上沿，窗口上沿中央留细条可恢复
+        add("collapse", "收起", "top", "收起顶部栏（悬停窗口上沿可恢复）", self.toggle_topbar)
         self.buttons["toc"].setCheckable(True)
         self.buttons["speed"].setCheckable(True)
 
         self.buttons["undo"].setEnabled(False)
         self.buttons["redo"].setEnabled(False)
+        self._apply_topbar_compact(self.width())
         return bar
 
     # ==================================================================
@@ -510,6 +734,12 @@ class MainWindow(QMainWindow):
         global_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
         global_shortcut.activated.connect(self.show_search_dialog)
 
+        proofread_shortcut = QShortcut(QKeySequence("Ctrl+Shift+K"), self)
+        proofread_shortcut.activated.connect(self.show_proofread_dialog)
+
+        focus_shortcut = QShortcut(QKeySequence("F11"), self)
+        focus_shortcut.activated.connect(self.toggle_focus_mode)
+
         new_chapter_shortcut = QShortcut(QKeySequence("Ctrl+N"), self)
         new_chapter_shortcut.activated.connect(
             lambda: self.new_chapter(self.current_volume_id)
@@ -523,8 +753,22 @@ class MainWindow(QMainWindow):
         redo_shortcut2.setContext(Qt.WidgetShortcut)
         redo_shortcut2.activated.connect(self.editor_page.editor.redo)
 
+        # 目录拖动排序撤销：仅在目录树获得焦点时生效，不拦截正文原生 Ctrl+Z
+        order_undo = QShortcut(QKeySequence("Ctrl+Z"), self.sidebar.tree)
+        order_undo.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        order_undo.activated.connect(self.undo_chapter_order)
+
         escape_shortcut = QShortcut(QKeySequence("Escape"), self)
-        escape_shortcut.activated.connect(lambda: self.drawer.close_drawer())
+        escape_shortcut.activated.connect(self._handle_escape)
+
+    def _handle_escape(self) -> None:
+        # 目录拖动中按 Esc：先取消拖动，顺序保持不变
+        if self.sidebar.tree.cancel_drag():
+            return
+        if self._focus_mode:
+            self.exit_focus_mode()
+            return
+        self.drawer.close_drawer()
 
     def _connect_signals(self) -> None:
         # 书架
@@ -542,6 +786,8 @@ class MainWindow(QMainWindow):
         self.shelf.profile_edit_requested.connect(self.edit_profile)
         self.shelf.avatar_import_requested.connect(self.change_avatar)
         self.shelf.view_changed.connect(self._on_shelf_view_changed)
+        self.shelf.notes_view_changed.connect(self._on_notes_view_changed)
+        self.shelf.set_notes_view(self.settings.notes_view)
 
         # 时间轴与设定（书架页管理）
         self.shelf.open_timeline_requested.connect(self.open_timeline)
@@ -570,7 +816,9 @@ class MainWindow(QMainWindow):
         self.shelf.rename_map_requested.connect(self.rename_map)
         self.shelf.delete_map_requested.connect(self.delete_map)
         self.shelf.stats_open_requested.connect(self.show_shelf_stats)
+        self.shelf.refresh_requested.connect(self._update_shelf)
         self.shelf.export_book_requested.connect(self.export_book)
+        self.shelf.export_book_chapters_requested.connect(self.export_book_chapters)
         self.shelf.cover_change_book_requested.connect(self.change_book_cover)
 
         # 导入（软件导出的同类型文件）
@@ -586,10 +834,12 @@ class MainWindow(QMainWindow):
 
         # 目录与编辑器
         self.sidebar.chapter_selected.connect(self.open_chapter)
+        self.sidebar.chapter_move_requested.connect(self.move_chapter)
         self.sidebar.new_chapter_requested.connect(self.new_chapter)
         self.sidebar.new_volume_requested.connect(self.new_volume)
         self.sidebar.rename_requested.connect(self.rename_item)
         self.sidebar.delete_requested.connect(self.delete_item)
+        self.sidebar.export_volume_requested.connect(self.export_volume)
         self.sidebar.new_related_requested.connect(self.add_related)
         self.sidebar.edit_related_requested.connect(self.edit_related)
         self.sidebar.delete_related_requested.connect(self.delete_related)
@@ -611,9 +861,13 @@ class MainWindow(QMainWindow):
         # 时速面板切换单位 / 统计开关后立即持久化
         self.editor_page.speed_panel.unit_changed.connect(self._on_speed_unit_changed)
         self.editor_page.speed_panel.tracking_changed.connect(self._on_speed_tracking_changed)
-        # 正文右键：段落设置 / 智能排版
+        # 正文右键：段落设置 / 智能排版 / 文本体检
         self.editor_page.paragraph_settings_requested.connect(self.show_paragraph_dialog)
         self.editor_page.smart_format_requested.connect(self.smart_format)
+        self.editor_page.proofread_requested.connect(self.show_proofread_dialog)
+        self.editor_page.focus_mode_requested.connect(self.toggle_focus_mode)
+        self.editor_page.find_requested.connect(self.show_find_dialog)
+        self.editor_page.new_chapter_requested.connect(self.new_chapter_here)
 
         self.editor_page.editor.undoAvailable.connect(self.buttons["undo"].setEnabled)
         self.editor_page.editor.redoAvailable.connect(self.buttons["redo"].setEnabled)
@@ -711,6 +965,8 @@ class MainWindow(QMainWindow):
         panel = self.shelf.characters_view()
         if panel is not None:
             panel.set_theme(theme)
+        # 主题重建后重新落位顶栏收起态（纸张圆角属性 & 恢复细条位置）
+        self._apply_topbar_state()
 
     def _refresh_icons(self) -> None:
         factory = self._icon_factory
@@ -770,40 +1026,53 @@ class MainWindow(QMainWindow):
 
     def show_bookshelf(self) -> None:
         """保存当前书并回到书架（主页使用极简顶栏）。"""
+        if self._focus_mode:
+            self.exit_focus_mode()
         self.flush()
         self.top_stack.setCurrentIndex(0)
         self.stack.setCurrentIndex(0)
+        self._apply_topbar_state()
         self._update_shelf()
 
     def _update_shelf(self) -> None:
-        library = self.storage.load_library()
-        cover_paths: dict[str, str] = {}
-        for meta in library["books"]:
-            path = self.storage.cover_abs(str(meta.get("cover") or ""))
-            if path is not None:
-                cover_paths[str(meta.get("id"))] = str(path)
-        self.shelf.set_books(library["books"], library["groups"], cover_paths)
-        self.shelf.set_timelines(library.get("timelines", []))
-        self.shelf.set_notes(library.get("notes", []))
-        self.shelf.set_outlines(library.get("outlines", []))
-        self.shelf.set_characters(
-            self.storage.load_characters(),
-            self.storage.load_relations(),
-            self._theme,
-            self.settings.character_view,
-        )
-        # 角色导出文件名 / 文件头使用当前作品名（面板未创建时不触发创建）
-        panel = self.shelf.characters_panel()
-        if panel is not None:
-            panel.book_name = self.book.title if self.book is not None else ""
-        self.shelf.set_maps(self.storage.load_maps())
-        self.shelf.set_achievements(self.achievements.unlocked)
-        self.shelf.set_showcase(self.settings.showcase_medal)
-        self.shelf.set_view(self.settings.shelf_view)
-        self.shelf.set_user(self.settings.nickname, self.settings.avatar_path)
+        # 连续多次 set_* 只重建一次页面；try/finally 保证异常后也不会卡在批量态
+        self.shelf.begin_batch()
+        try:
+            library = self.storage.load_library()
+            cover_paths: dict[str, str] = {}
+            for meta in library["books"]:
+                path = self.storage.cover_abs(str(meta.get("cover") or ""))
+                if path is not None:
+                    cover_paths[str(meta.get("id"))] = str(path)
+            self.shelf.set_books(library["books"], library["groups"], cover_paths)
+            self.shelf.set_timelines(library.get("timelines", []))
+            self.shelf.set_notes(library.get("notes", []))
+            self.shelf.set_outlines(library.get("outlines", []))
+            self.shelf.set_characters(
+                self.storage.load_characters(),
+                self.storage.load_relations(),
+                self._theme,
+                self.settings.character_view,
+            )
+            # 角色导出文件名 / 文件头使用当前作品名（面板未创建时不触发创建）
+            panel = self.shelf.characters_panel()
+            if panel is not None:
+                panel.book_name = self.book.title if self.book is not None else ""
+            self.shelf.set_maps(self.storage.load_maps())
+            self.shelf.set_achievements(self.achievements.unlocked)
+            self.shelf.set_showcase(self.settings.showcase_medal)
+            self.shelf.set_view(self.settings.shelf_view)
+            self.shelf.set_user(self.settings.nickname, self.settings.avatar_path)
+        finally:
+            self.shelf.end_batch()
 
     def _on_shelf_view_changed(self, view: str) -> None:
         self.settings.shelf_view = view
+        self.storage.save_settings(self.settings)
+
+    def _on_notes_view_changed(self, view: str) -> None:
+        """记住设定页用的是卡片还是列表，重开程序保持。"""
+        self.settings.notes_view = view if view in {"grid", "list"} else "grid"
         self.storage.save_settings(self.settings)
 
     # ==================================================================
@@ -1004,8 +1273,10 @@ class MainWindow(QMainWindow):
         if self.book is not None:
             self.top_stack.setCurrentIndex(1)
             self.stack.setCurrentIndex(1)
+            self._apply_topbar_state()
             self.open_chapter(self.current_chapter_id)
             self.editor_page.focus_editor()
+            QTimer.singleShot(0, self._position_side_toggle)
             # 上次退出时若展开着仿写区，打开书籍后还原（面板本身懒加载，不预建）
             if getattr(self.settings, "snippets_open", False) and not self._snippets_visible:
                 self.toggle_snippets_panel(True)
@@ -1015,6 +1286,7 @@ class MainWindow(QMainWindow):
         if book is None:
             return
         self.book = book
+        self._chapter_order_undo.clear()
         if not keep_chapter or not book.find_chapter(self.current_chapter_id)[1]:
             self.current_chapter_id = book.last_chapter_id
         volume = book.volume_of(self.current_chapter_id)
@@ -1046,54 +1318,87 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # 保存与快照
     # ==================================================================
-    def flush(self, force_snapshot: bool = False) -> None:
-        """立即保存当前章节的未落盘修改。
+    def flush(self, force_snapshot: bool = False) -> bool:
+        """立即保存当前章节的未落盘修改；返回是否真实写入成功。
 
         每次自动保存都会记录一个历史版本；自动快照按 config.AUTO_SNAPSHOT_GAP
-        去重，手动保存（Ctrl+S）等 force_snapshot=True 的调用始终立即记录。
+        的时间间隔或 config.AUTO_SNAPSHOT_CHAR_DELTA 的字数变化去重，
+        手动保存（Ctrl+S）等 force_snapshot=True 的调用始终立即记录。
         """
         if self.book is None or not self.current_chapter_id:
-            return
+            return True
         if self._editor_chapter_id != self.current_chapter_id:
             # 编辑器里还是别的书/章节的旧文本（如刚切换书籍但尚未载入），
             # 此时把编辑器文本写回会覆盖新章节内容，必须跳过。
-            return
+            return True
         volume, chapter = self.book.find_chapter(self.current_chapter_id)
         if chapter is None:
-            return
+            return True
         text = self.editor_page.current_text()
         if text == chapter.content:
-            return
+            return True
+        previous = chapter.content
         chapter.content = text
         chapter.updated_at = time.time()
         self.book.touch()
         self.counts[chapter.id] = count_chars(text, self.settings.exclude_punct)
-        self.storage.save_book(self.book, self._total_chars)
+        try:
+            self.storage.save_book(self.book, self._total_chars)
+        except Exception as exc:   # noqa: BLE001 - 任何落盘异常都要如实反馈
+            # 回滚内存里的正文，下一次 flush 才会真正重试而不是误判“无改动”
+            chapter.content = previous
+            self._last_save_error = str(exc) or exc.__class__.__name__
+            return False
         self.sidebar.set_saved_time(time.strftime("%H:%M"))
 
-        # 历史版本：随自动保存记录，每本书最多保留 history_cap() 个
+        # 历史版本：随自动保存记录，每章最多保留 history_cap() 个；
+        # 自动快照按「时间间隔 或 字数变化」阈值去重，手动保存始终立即记录。
         now = time.time()
-        if force_snapshot or now - self._last_auto_snapshot >= config.AUTO_SNAPSHOT_GAP:
-            self._last_auto_snapshot = now
-            self.storage.save_snapshot(
-                self.book.id,
-                chapter.id,
-                text,
-                self.counts[chapter.id],
-                cap=self.achievements.history_cap(),
-            )
+        current_chars = self.counts[chapter.id]
+        last_time, last_chars = self._snapshot_marks.get(chapter.id, (0.0, -1))
+        if (
+            force_snapshot
+            or now - last_time >= config.AUTO_SNAPSHOT_GAP
+            or abs(current_chars - last_chars) >= config.AUTO_SNAPSHOT_CHAR_DELTA
+        ):
+            self._snapshot_marks[chapter.id] = (now, current_chars)
+            try:
+                self.storage.save_snapshot(
+                    self.book.id,
+                    chapter.id,
+                    text,
+                    current_chars,
+                    cap=self.achievements.history_cap(),
+                )
+            except Exception:   # noqa: BLE001 - 快照失败不影响正文已落盘的事实
+                pass
+        return True
 
-    def save_current_book(self) -> None:
+    def save_current_book(self) -> bool:
         if self._dirty:
-            self.flush()
-            self._dirty = False
-            self.editor_page.set_saved_text(time.strftime("%H:%M"))
+            self.editor_page.begin_save()
+            ok = self.flush()
+            self._dirty = not ok
+            if not ok:
+                self.autosave_timer.start()   # 失败后保持脏标记，稍后自动重试
+            self.editor_page.set_save_result(ok, time.strftime("%H:%M"), self._last_save_error)
+            return ok
+        return True
 
     def _manual_save(self) -> None:
-        self.flush(force_snapshot=True)
-        self._dirty = False
-        self.editor_page.set_saved_text(time.strftime("%H:%M"))
+        self.editor_page.begin_save()
+        ok = self.flush(force_snapshot=True)
+        self._dirty = not ok
+        if not ok:
+            self.autosave_timer.start()
+        else:
+            self._play_save_sound()
+        self.editor_page.set_save_result(ok, time.strftime("%H:%M"), self._last_save_error)
         self.editor_page.focus_editor()
+
+    def _play_save_sound(self) -> None:
+        """手动保存成功后播放所选提示音；自动保存不经过这里，保持静默。"""
+        play_manual_save_sound(str(getattr(self.settings, "manual_save_sound", "wood")))
 
     def _on_title_edited(self, title: str) -> None:
         """双击正文标题改名：与左侧目录重命名走同一套数据流。"""
@@ -1231,11 +1536,18 @@ class MainWindow(QMainWindow):
         """解锁成就：初次解锁时右下角弹窗庆祝；返回是否为本次初次解锁。"""
         if not self.achievements.unlock(key):
             return False
+        self._play_achievement_sound()
         toast = AchievementToast(key, self)
         toast.show_at()
         self.shelf.set_achievements(self.achievements.unlocked)
         self.shelf.set_showcase(self.settings.showcase_medal)
         return True
+
+    def _play_achievement_sound(self) -> None:
+        """成就真正解锁时播放一次预渲染 WAV（音量已烘焙进音频，不做实时调节）。"""
+        if not bool(getattr(self.settings, "achievement_sound", True)):
+            return
+        play_wav(config.ASSETS_DIR / "sounds" / "achievement_unlock.wav")
 
     def _set_showcase_medal(self, key: str) -> None:
         """成就页右键：设置 / 卸下首页左下角展示的勋章（仅限已解锁成就）。"""
@@ -1359,6 +1671,119 @@ class MainWindow(QMainWindow):
         self._search_dialog.show()
         self._search_dialog.raise_()
         self._search_dialog.refresh()
+
+    def show_proofread_dialog(self) -> None:
+        if self.book is None or not self.current_chapter_id:
+            MessageBox.information(self, "文本体检", "请先打开一本书并进入正文章节。")
+            return
+        if self._proofread_dialog is None:
+            self._proofread_dialog = ProofreadDialog(self)
+        self._proofread_dialog.show()
+        self._proofread_dialog.raise_()
+        self._proofread_dialog.rescan()
+
+    # ==================================================================
+    # 专注模式（沉浸式）
+    # ==================================================================
+    def toggle_focus_mode(self) -> None:
+        if self._focus_mode:
+            self.exit_focus_mode()
+        else:
+            self.enter_focus_mode()
+
+    def enter_focus_mode(self) -> None:
+        """隐藏侧栏 / 顶栏 / 底部字数行，正文铺满，光标行滚动居中。"""
+        if self._focus_mode or self.stack.currentIndex() != 1:
+            return
+        if self.book is None or not self.current_chapter_id:
+            return
+        editor = self.editor_page.editor
+        cursor = editor.textCursor()
+        self._focus_snapshot = {
+            "sidebar": not self.sidebar.isHidden(),
+            "snippets": bool(self._snippets_visible),
+            "speed": not self.editor_page.speed_panel.isHidden(),
+            "scroll": editor.verticalScrollBar().value(),
+            "anchor": cursor.anchor(),
+            "position": cursor.position(),
+        }
+        self._focus_mode = True
+        self.sidebar.hide()
+        self.side_toggle_bar.hide()
+        self.top_stack.hide()
+        self.top_reveal.hide()
+        if self._snippets_visible:
+            self._snippets_visible = False
+            if self._snippets_panel is not None:
+                self._snippets_panel.hide()
+            handle = self.editor_split.handle(1)
+            if handle is not None:
+                handle.hide()
+        self.editor_page.speed_panel.hide()
+        self.editor_page.set_focus_mode(True)
+        self._apply_workspace_flush()
+        self._sync_focus_button()
+        self.editor_page.focus_editor()
+
+    def exit_focus_mode(self) -> None:
+        """恢复进入前的布局、光标、选区、滚动位置与撤销栈。"""
+        if not self._focus_mode:
+            return
+        snapshot = self._focus_snapshot or {}
+        self._focus_mode = False
+        self.editor_page.set_focus_mode(False)
+
+        sidebar_visible = bool(snapshot.get("sidebar", True))
+        self.sidebar.setVisible(sidebar_visible)
+        self.buttons["toc"].setChecked(sidebar_visible)
+        self.side_toggle_bar.show()
+
+        if snapshot.get("snippets"):
+            panel = self._ensure_snippets_panel()
+            self._snippets_visible = True
+            self.sidebar.btn_snippets.setChecked(True)
+            self._apply_snippets_width()
+            panel.show()
+            handle = self.editor_split.handle(1)
+            if handle is not None:
+                handle.show()
+            panel.raise_()
+        else:
+            self._snippets_visible = False
+            self.sidebar.btn_snippets.setChecked(False)
+            if self._snippets_panel is not None:
+                self._snippets_panel.hide()
+            handle = self.editor_split.handle(1)
+            if handle is not None:
+                handle.hide()
+
+        if snapshot.get("speed"):
+            self.editor_page.speed_panel.show()
+
+        self._apply_topbar_state()
+        self._apply_workspace_flush()
+        self._update_side_toggle_arrow()
+
+        editor = self.editor_page.editor
+        cursor = editor.textCursor()
+        cursor.setPosition(int(snapshot.get("anchor", 0)))
+        cursor.setPosition(
+            int(snapshot.get("position", 0)), QTextCursor.KeepAnchor
+        )
+        editor.setTextCursor(cursor)
+        scroll = int(snapshot.get("scroll", 0))
+        bar = editor.verticalScrollBar()
+        # 贴边恢复会按比例延后调整滚动，这里排在它之后落回进入前的精确位置
+        QTimer.singleShot(0, lambda: bar.setValue(min(scroll, bar.maximum())))
+        self._focus_snapshot = None
+        self._sync_focus_button()
+        self.editor_page.focus_editor()
+
+    def _sync_focus_button(self) -> None:
+        """顶栏「专注」按钮的激活态始终跟随真实专注状态（含 F11 / Esc 入口）。"""
+        button = self.buttons.get("focus")
+        if button is not None:
+            button.setChecked(bool(self._focus_mode))
 
     def find_next_in_book(self, needle: str, case: bool) -> bool:
         """在当前章节之后的章节里查找，找到则打开对应章节。"""
@@ -1625,6 +2050,10 @@ class MainWindow(QMainWindow):
             existing.raise_()
             existing.activateWindow()
             return
+        # 进入新的设定编辑窗前，先把上一篇未落盘的修改落盘
+        for other in self._note_windows.values():
+            if other.isVisible():
+                other.flush_pending()
         doc = None
         for item in self.storage.load_library().get("notes", []):
             if item.get("id") == note_id:
@@ -1633,10 +2062,16 @@ class MainWindow(QMainWindow):
         if doc is None:
             return
         window = NoteEditorWindow(self.storage, doc, self)
-        window.saved.connect(self._update_shelf)
+        window.saved.connect(lambda w=window: self._on_note_saved(w))
         window.closed.connect(self._on_note_window_closed)
         window.show()
         self._note_windows[note_id] = window
+
+    def _on_note_saved(self, window) -> None:
+        """设定保存后只就地更新这一条卡片，不重建整页。"""
+        doc = dict(getattr(window, "doc", {}) or {})
+        if doc.get("id"):
+            self.shelf.update_note(doc)
 
     def _on_note_window_closed(self, note_id: str) -> None:
         self._note_windows.pop(note_id, None)
@@ -1912,6 +2347,142 @@ class MainWindow(QMainWindow):
             return
         MessageBox.information(self, "导出成功", f"已导出到：\n{path}")
 
+    def export_volume(self, volume_id: str) -> None:
+        """把某一卷导出为单个 txt / docx 文件（只读：不改正文、不写盘、不响音效）。"""
+        if self.book is None:
+            return
+        volume = self.book.find_volume(volume_id)
+        if volume is None:
+            return
+        if not volume.chapters:
+            MessageBox.information(self, "无法导出", "该卷还没有章节，请先新建章节再导出。")
+            return
+
+        dialog = VolumeExportDialog(self, volume.title)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        fmt = dialog.chosen_format()
+
+        default_dir = str(self.settings.export_dir or "").strip()
+        if not default_dir or not Path(default_dir).is_dir():
+            default_dir = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+        if not default_dir:
+            default_dir = str(Path.home())
+        default_path = str(
+            Path(default_dir) / f"{exporter.sanitize_filename(volume.title)}.{fmt}"
+        )
+        name_filter = "Word 文档 (*.docx)" if fmt == exporter.DOCX_FORMAT else "文本文档 (*.txt)"
+        path, _f = QFileDialog.getSaveFileName(self, "导出本卷", default_path, name_filter)
+        if not path:
+            return
+        if not path.lower().endswith("." + fmt):
+            path += "." + fmt
+
+        # 用内存数据组装；当前章若正在编辑，取编辑器里的最新文本（不触发保存）
+        chapters: list[tuple[str, str]] = []
+        for chapter in volume.chapters:
+            text = chapter.content
+            if chapter.id == self.current_chapter_id and chapter.id == self._editor_chapter_id:
+                text = self.editor_page.current_text()
+            chapters.append((chapter.title, text))
+        try:
+            exporter.export_volume_file(path, fmt, chapters, self.settings)
+        except Exception as exc:   # noqa: BLE001 - 写入失败要如实提示且不留残文件
+            MessageBox.warning(self, "导出失败", f"无法写入文件：{exc}")
+            return
+
+        directory = str(Path(path).parent)
+        if directory and directory != self.settings.export_dir:
+            self.settings.export_dir = directory
+            try:
+                self.storage.save_settings(self.settings)
+            except Exception:   # noqa: BLE001 - 记忆目录失败不影响导出结果
+                pass
+        MessageBox.information(self, "导出成功", f"已导出到：\n{path}")
+
+    def _ask_export_folder_conflict(self, folder_name: str) -> str:
+        """同名文件夹处理：合并 / 新建带时间戳 / 取消。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("文件夹已存在")
+        box.setText(f"「{folder_name}」已经存在，要如何处理？")
+        merge_button = box.addButton("合并到已有文件夹", QMessageBox.ButtonRole.AcceptRole)
+        new_button = box.addButton("新建带时间戳的文件夹", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(merge_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is merge_button:
+            return "merge"
+        if clicked is new_button:
+            return "timestamp"
+        return "cancel"
+
+    def export_book_chapters(self, book_id: str) -> None:
+        """整本导出：一章一个文件、平铺在「书名」文件夹内（只读）。"""
+        book = self.book if (self.book is not None and self.book.id == book_id) \
+            else self.storage.load_book(book_id)
+        if book is None:
+            return
+
+        chapters: list[tuple[str, str]] = []
+        for volume in book.volumes:
+            for chapter in volume.chapters:
+                text = chapter.content
+                if (self.book is not None and self.book.id == book_id
+                        and chapter.id == self.current_chapter_id
+                        and chapter.id == self._editor_chapter_id):
+                    text = self.editor_page.current_text()
+                chapters.append((chapter.title, text))
+        if not chapters:
+            MessageBox.information(self, "无法导出", "这本书还没有章节，请先新建章节再导出。")
+            return
+
+        dialog = VolumeExportDialog(self, book.title, mode=MODE_BOOK)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        fmt = dialog.chosen_format()
+
+        default_dir = str(self.settings.export_dir or "").strip()
+        if not default_dir or not Path(default_dir).is_dir():
+            default_dir = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+        if not default_dir:
+            default_dir = str(Path.home())
+        parent = QFileDialog.getExistingDirectory(self, "选择导出位置", default_dir)
+        if not parent:
+            return
+
+        folder_name = exporter.sanitize_filename(
+            book.title, max_chars=80, fallback="未命名作品")
+        if (Path(parent) / folder_name).exists():
+            choice = self._ask_export_folder_conflict(folder_name)
+            if choice == "cancel":
+                return
+            if choice == "timestamp":
+                folder_name = exporter.timestamped_folder_name(parent, folder_name)
+
+        try:
+            folder, files = exporter.export_book_directory(
+                parent, folder_name, fmt, chapters, self.settings)
+        except exporter.BookExportError as exc:
+            MessageBox.warning(
+                self, "导出失败",
+                f"已成功导出 {exc.success_count}/{exc.total} 章，"
+                f"「{exc.failed_name}」写入失败：{exc.reason}",
+            )
+            return
+        except Exception as exc:   # noqa: BLE001 - 失败要中文提示且不留半截文件
+            MessageBox.warning(self, "导出失败", f"无法导出：{exc}")
+            return
+
+        if parent != self.settings.export_dir:
+            self.settings.export_dir = parent
+            try:
+                self.storage.save_settings(self.settings)
+            except Exception:   # noqa: BLE001 - 记忆目录失败不影响导出结果
+                pass
+        MessageBox.information(
+            self, "导出成功", f"已导出 {len(files)} 章到：\n{folder}")
+
     # ==================================================================
     # 导入（兼容本软件历史版本 / 当前版本导出的同类型文件）
     # ==================================================================
@@ -2140,23 +2711,55 @@ class MainWindow(QMainWindow):
     def show_history_dialog(self) -> None:
         if self.book is None or not self.current_chapter_id:
             return
+        self.flush()   # 先把编辑区未落盘的修改写入，历史列表才与当前内容一致
         _volume, chapter = self.book.find_chapter(self.current_chapter_id)
         if chapter is None:
             return
         dialog = HistoryDialog(
-            self.storage, self.book.id, chapter.id, chapter.title, self
+            self.storage,
+            self.book.id,
+            chapter.id,
+            chapter.title,
+            self.achievements.history_cap(),
+            self,
         )
         if dialog.exec() == HistoryDialog.Accepted:
             content = dialog.selected_content()
-            if content is not None:
-                chapter.content = content
-                chapter.updated_at = time.time()
-                self.book.touch()
-                self.storage.save_book(self.book, self._total_chars)
-                self.editor_page.load_text(chapter.title, content)
-                self._editor_chapter_id = self.current_chapter_id
-                self.counts[chapter.id] = count_chars(content, self.settings.exclude_punct)
-                self.sidebar_timer.start()
+            if content is None:
+                return
+            # 还原前先把当前内容另存一版，避免「还原即丢失」；
+            # 若刚刚的 flush 已经存下同一份内容则不重复写盘。
+            previous_text = self.editor_page.current_text()
+            if content == previous_text:
+                return
+            snapshots = self.storage.list_snapshots(self.book.id, chapter.id)
+            already_kept = bool(
+                snapshots
+                and self.storage.snapshot_content(snapshots[0]) == previous_text
+            )
+            if not already_kept:
+                try:
+                    self.storage.save_snapshot(
+                        self.book.id,
+                        chapter.id,
+                        previous_text,
+                        count_chars(previous_text, self.settings.exclude_punct),
+                        cap=self.achievements.history_cap(),
+                    )
+                except Exception as exc:   # noqa: BLE001 - 保底失败则取消还原
+                    MessageBox.warning(
+                        self, "恢复已取消", f"当前内容备份失败，为避免丢失已中止恢复：\n{exc}"
+                    )
+                    return
+            chapter.content = content
+            chapter.updated_at = time.time()
+            self.book.touch()
+            self.storage.save_book(self.book, self._total_chars)
+            self.editor_page.load_text(chapter.title, content)
+            self._editor_chapter_id = self.current_chapter_id
+            self.counts[chapter.id] = count_chars(content, self.settings.exclude_punct)
+            self._snapshot_marks[chapter.id] = (time.time(), self.counts[chapter.id])
+            self.sidebar_timer.start()
 
     # ==================================================================
     # WebDAV 同步
@@ -2414,10 +3017,95 @@ class MainWindow(QMainWindow):
     # 目录操作
     # ==================================================================
     def toggle_sidebar(self) -> None:
-        visible = not self.sidebar.isVisible()
+        visible = self.sidebar.isHidden()
         self.sidebar.setVisible(visible)
         self.buttons["toc"].setChecked(visible)
         self._update_side_toggle_arrow()
+        self._apply_workspace_flush()
+
+    # ------------------------------------------------------------------
+    # 顶栏收起 / 展开
+    # ------------------------------------------------------------------
+    def toggle_topbar(self) -> None:
+        self._set_topbar_collapsed(not bool(getattr(self.settings, "topbar_collapsed", False)))
+
+    def _set_topbar_collapsed(self, collapsed: bool, save: bool = True) -> None:
+        self.settings.topbar_collapsed = bool(collapsed)
+        if save:
+            self.storage.save_settings(self.settings)
+        self._apply_topbar_state()
+
+    def _apply_topbar_state(self) -> None:
+        """按“当前页面 + 已保存状态”实时决定顶栏显隐与纸张是否贴顶。
+
+        书架页始终保留顶栏（收起只针对写作页），回到写作页再按保存状态收起；
+        状态持久化由 _set_topbar_collapsed 立即写盘，重开程序保持一致。
+        """
+        collapsed = (
+            bool(getattr(self.settings, "topbar_collapsed", False))
+            and self.stack.currentIndex() == 1
+        )
+        if collapsed:
+            self.top_stack.setFixedHeight(0)
+            self.top_stack.hide()
+        else:
+            self.top_stack.setFixedHeight(64)
+            self.top_stack.show()
+        self.editor_page.set_top_flush(collapsed)
+        reveal = getattr(self, "top_reveal", None)
+        if reveal is not None:
+            reveal.setVisible(collapsed)
+            if collapsed:
+                self._position_top_reveal()
+                reveal.raise_()
+        self._apply_workspace_flush()
+
+    def _position_top_reveal(self) -> None:
+        reveal = getattr(self, "top_reveal", None)
+        if reveal is None:
+            return
+        reveal.move(max(0, (self.root.width() - reveal.width()) // 2), 0)
+
+    # ------------------------------------------------------------------
+    # 左右栏收起：纸张贴边（不留底色条 / 圆角空档）
+    # ------------------------------------------------------------------
+    def _apply_workspace_flush(self) -> None:
+        """按左右栏显隐把纸张对应一侧贴到窗口边缘。
+
+        侧栏显隐是瞬时布局切换（无动画），因此不需要逐帧跟随；
+        贴边只改外边距与圆角，正文宽度仍由编辑器视口决定，滚动位置按比例恢复。
+        """
+        writing = self.stack.currentIndex() == 1
+        left_flush = writing and self.sidebar.isHidden()
+        right_flush = writing and not self._snippets_visible
+
+        spacer = getattr(self, "side_toggle_spacer", None)
+        if spacer is not None:
+            if left_flush:
+                spacer.setFixedWidth(0)
+                spacer.hide()
+            else:
+                spacer.setFixedWidth(16)
+                spacer.show()
+
+        self.editor_page.set_side_flush(left_flush, right_flush)
+
+        bar = getattr(self, "side_toggle_bar", None)
+        if bar is not None:
+            button = self.side_toggle_button
+            if bool(button.property("floating")) != left_flush:
+                button.setProperty("floating", left_flush)
+                button.style().unpolish(button)
+                button.style().polish(button)
+            self._position_side_toggle()
+
+    def _position_side_toggle(self) -> None:
+        bar = getattr(self, "side_toggle_bar", None)
+        if bar is None:
+            return
+        x = 0 if self.sidebar.isHidden() else self.sidebar.width()
+        bar.setGeometry(x, 0, 16, max(1, self.workspace.height()))
+        bar.raise_()
 
     def toggle_drawer(self) -> None:
         self.drawer.toggle()
@@ -2432,7 +3120,25 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event) -> None:  # noqa: N802
         if event.type() == QEvent.ActivationChange and self.isActiveWindow():
             self._selfcheck_editor("activate")
+        elif event.type() == QEvent.WindowStateChange:
+            from app.ui import motion
+            if self.windowState() & Qt.WindowState.WindowMinimized:
+                motion.hold_animations("minimized")
+            else:
+                motion.release_animations("minimized")
         super().changeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """重新可见：解除动效挂起，从当前帧继续。"""
+        from app.ui import motion
+        motion.release_animations("hidden")
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        """窗口 Hide：停掉动画定时器，避免后台空转。"""
+        from app.ui import motion
+        motion.hold_animations("hidden")
+        super().hideEvent(event)
 
     def _refocus_editor_after_drawer(self) -> None:
         """设置关闭后焦点交还正文（不必再点一次才能输入）。"""
@@ -2500,6 +3206,7 @@ class MainWindow(QMainWindow):
                 handle.show()
             panel.raise_()
             self._remember_snippets_open(True)
+            self._apply_workspace_flush()
             return
         # 先记住拖拽宽度，再真正收起（收起后宽度会变 0）
         self._persist_snippets_width()
@@ -2511,6 +3218,7 @@ class MainWindow(QMainWindow):
         if handle is not None:
             handle.hide()
         self._remember_snippets_open(False)
+        self._apply_workspace_flush()
 
     def _remember_snippets_open(self, opened: bool) -> None:
         """面板开合状态写回 Settings（与宽度字段一起，不新增重复键）。"""
@@ -2563,6 +3271,17 @@ class MainWindow(QMainWindow):
         self.sidebar.set_book(self.book, self.counts, self.current_chapter_id)
         self.open_chapter(chapter.id)
 
+    def new_chapter_here(self) -> None:
+        """正文右键「新建章节」：建在当前章节所在卷，没有当前章就用第一卷。"""
+        if self.book is None:
+            return
+        volume_id = ""
+        if self.current_chapter_id:
+            volume, _chapter = self.book.find_chapter(self.current_chapter_id)
+            if volume is not None:
+                volume_id = volume.id
+        self.new_chapter(volume_id)
+
     def new_volume(self) -> None:
         if self.book is None:
             return
@@ -2610,6 +3329,7 @@ class MainWindow(QMainWindow):
                 if chapter in volume.chapters:
                     volume.chapters.remove(chapter)
             self.storage.delete_snapshots(self.book.id, item_id)
+            self._snapshot_marks.pop(item_id, None)
             self.counts.pop(item_id, None)
             if item_id == self.current_chapter_id:
                 self.current_chapter_id = ""
@@ -2621,6 +3341,7 @@ class MainWindow(QMainWindow):
                 return
             for chapter in volume.chapters:
                 self.storage.delete_snapshots(self.book.id, chapter.id)
+                self._snapshot_marks.pop(chapter.id, None)
                 self.counts.pop(chapter.id, None)
                 if chapter.id == self.current_chapter_id:
                     self.current_chapter_id = ""
@@ -2638,6 +3359,91 @@ class MainWindow(QMainWindow):
                 self.editor_page.clear_page()
         else:
             self.open_chapter(self.current_chapter_id)
+
+    # ==================================================================
+    # 目录拖动排序
+    # ==================================================================
+    ORDER_UNDO_LIMIT = 20
+
+    def _order_snapshot(self) -> list[tuple[str, list[str]]]:
+        if self.book is None:
+            return []
+        return [(vol.id, [ch.id for ch in vol.chapters]) for vol in self.book.volumes]
+
+    def _sync_editor_text(self) -> None:
+        """把编辑器里未落盘的正文同步进内存（不写盘），供重排一次保存。"""
+        if self.book is None or not self.current_chapter_id:
+            return
+        if self._editor_chapter_id != self.current_chapter_id:
+            return
+        _volume, chapter = self.book.find_chapter(self.current_chapter_id)
+        if chapter is None:
+            return
+        text = self.editor_page.current_text()
+        if text == chapter.content:
+            return
+        chapter.content = text
+        chapter.updated_at = time.time()
+        self.counts[chapter.id] = count_chars(text, self.settings.exclude_punct)
+        self._total_chars = self._other_chars + self.counts.get(self.current_chapter_id, 0)
+        self.book.touch()
+
+    def move_chapter(self, chapter_id: str, target_volume_id: str, target_index: int) -> None:
+        """目录拖动落地：卷内 / 跨卷重排章节数组，立即落盘一次。"""
+        if self.book is None:
+            return
+        src_volume, chapter = self.book.find_chapter(chapter_id)
+        if chapter is None or src_volume is None:
+            return
+        dst_volume = self.book.find_volume(target_volume_id)
+        if dst_volume is None:
+            return
+        target_index = max(0, min(int(target_index), len(dst_volume.chapters)))
+        old_index = src_volume.chapters.index(chapter)
+        if src_volume is dst_volume and target_index in (old_index, old_index + 1):
+            return   # 原地不动，不产生撤销步，也不写盘
+        self._sync_editor_text()
+        self._chapter_order_undo.append(self._order_snapshot())
+        if len(self._chapter_order_undo) > self.ORDER_UNDO_LIMIT:
+            self._chapter_order_undo.pop(0)
+        src_volume.chapters.pop(old_index)
+        if src_volume is dst_volume and target_index > old_index:
+            target_index -= 1
+        dst_volume.chapters.insert(target_index, chapter)
+        self.book.touch()
+        self.storage.save_book(self.book, self._total_chars)
+        self._refresh_after_reorder()
+
+    def undo_chapter_order(self) -> None:
+        """目录树焦点下的 Ctrl+Z：还原上一次拖动排序（一次拖动 = 一步撤销）。"""
+        if self.book is None or not self._chapter_order_undo:
+            return
+        snapshot = self._chapter_order_undo.pop()
+        volumes = {vol.id: vol for vol in self.book.volumes}
+        chapters = {ch.id: ch for ch in self.book.all_chapters()}
+        snapshot_ids = {cid for _vid, ids in snapshot for cid in ids}
+        for volume_id, chapter_ids in snapshot:
+            volume = volumes.get(volume_id)
+            if volume is None:
+                continue
+            restored = [chapters[cid] for cid in chapter_ids if cid in chapters]
+            # 快照之后新增的章节不丢，追加在卷尾；快照里属于别的卷的章节不重复保留
+            extra = [ch for ch in volume.chapters if ch.id not in snapshot_ids]
+            volume.chapters = restored + extra
+        self.book.touch()
+        self.storage.save_book(self.book, self._total_chars)
+        self._refresh_after_reorder()
+
+    def _refresh_after_reorder(self) -> None:
+        """重排或撤销后刷新目录与卷归属，当前章保持打开、正文与光标不动。"""
+        if self.book is None:
+            return
+        volume = self.book.volume_of(self.current_chapter_id)
+        self.current_volume_id = volume.id if volume is not None else ""
+        self.sidebar.set_book(self.book, self.counts, self.current_chapter_id)
+        if self.current_chapter_id:
+            self.sidebar.select_chapter(self.current_chapter_id)
+        self.sidebar.set_saved_time(time.strftime("%H:%M"))
 
     # ==================================================================
     # 相关设定
@@ -2692,9 +3498,22 @@ class MainWindow(QMainWindow):
     def _confirm(self, title: str, text: str) -> bool:
         return MessageBox.question(self, title, text)
 
+    def _apply_topbar_compact(self, width: int) -> None:
+        """窄窗口下顶栏按钮收窄（58→48），避免 2 字标签挤压与按钮溢出。"""
+        compact = width < 1250
+        if self._topbar_compact == compact:
+            return
+        self._topbar_compact = compact
+        for button in getattr(self, "buttons", {}).values():
+            button.set_compact(compact)
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        self._apply_topbar_compact(self.width())
         self.drawer.relayout()
+        reveal = getattr(self, "top_reveal", None)
+        if reveal is not None and reveal.isVisible():
+            self._position_top_reveal()
         if self._snippets_visible and self._snippets_panel is not None:
             maxw = self._snippets_max_width()
             self._snippets_panel.setMaximumWidth(maxw)
@@ -2702,29 +3521,151 @@ class MainWindow(QMainWindow):
             if len(sizes) == 2 and sizes[1] > maxw:
                 total = sum(sizes)
                 self.editor_split.setSizes([max(0, total - maxw), maxw])
+        self._position_side_toggle()
 
     def closeEvent(self, event) -> None:
-        # 关闭软件前把未落盘的内容全部保存一次
+        # 第二次（浮层流程结束后）才真正关闭
+        if self._close_from_flow:
+            self._settle_workers(timeout_ms=200)
+            super().closeEvent(event)
+            return
+        # 首次关闭：拦下事件，先显示保存浮层，落盘结果确认后再关
+        event.ignore()
+        if self._close_flow_active:
+            return
+        if self._exit_overlay is not None:
+            self._exit_retry()   # 失败浮层还在：再次点关闭等同于重试
+            return
+        self._begin_exit_flow()
+
+    # ------------------------------------------------------------------
+    # 退出保存浮层
+    # ------------------------------------------------------------------
+    def _begin_exit_flow(self) -> None:
+        self._close_flow_active = True
         self.auto_sync_timer.stop()
         self.autosave_timer.stop()
-        self.save_current_book()
-        self.flush()
         self.words_timer.stop()
-        self._flush_words()
-        if self._snippets_panel is not None:
-            self._snippets_panel.flush_pending()
-        # 独立窗口 / 面板里可能还有防抖未触发的改动（时间轴、大纲、设定、
-        # 地图、角色关系），逐个 flush，避免强关窗口时丢最后一批编辑。
-        for dialog in list(self._timeline_dialogs):
-            dialog.flush_pending()
-        for dialog in list(self._outline_dialogs):
-            dialog.flush_pending()
-        for dialog in list(self._map_dialogs.values()):
-            dialog.flush_pending()
-        for window in list(self._note_windows.values()):
-            window.flush_pending()
-        panel = self.shelf.characters_view()
-        if panel is not None:
-            panel.flush_pending()
-        self.storage.save_settings(self.settings)
-        super().closeEvent(event)
+        self._exit_started = time.monotonic()
+        overlay = ExitSaveOverlay(self)
+        overlay.retry_requested.connect(self._exit_retry)
+        overlay.cancel_requested.connect(self._exit_cancel)
+        self._exit_overlay = overlay
+        overlay.show_saving()
+        # 先让圆环画出来，再在下一轮事件循环做同步落盘：动画真的会动，
+        # 且最终状态完全来自 flush 的返回值（不起线程、不冻结事件循环）。
+        QTimer.singleShot(0, self._exit_do_flush)
+
+    def _exit_do_flush(self) -> None:
+        ok, reason = self._flush_all_before_close()
+        elapsed_ms = (time.monotonic() - getattr(self, "_exit_started", time.monotonic())) * 1000
+        # 最短显示 0.5 秒：保存极快时也要把旋转这段走完，避免一闪而过
+        remaining = max(0, int(500 - elapsed_ms))
+        if ok:
+            QTimer.singleShot(remaining, self._exit_show_success)
+        else:
+            QTimer.singleShot(remaining, lambda r=reason: self._exit_show_error(r))
+
+    def _flush_all_before_close(self) -> tuple[bool, str]:
+        """复用原 closeEvent 的落盘顺序；返回 (是否主稿写入成功, 失败原因)。"""
+        ok = True
+        reason = ""
+        try:
+            self._last_save_error = ""
+            ok = self.save_current_book()
+            if not self.flush():
+                ok = False
+            self.words_timer.stop()
+            self._flush_words()
+            if self._snippets_panel is not None:
+                self._snippets_panel.flush_pending()
+            # 独立窗口 / 面板里可能还有防抖未触发的改动（时间轴、大纲、设定、
+            # 地图、角色关系），逐个 flush，避免强关窗口时丢最后一批编辑。
+            for dialog in list(self._timeline_dialogs):
+                dialog.flush_pending()
+            for dialog in list(self._outline_dialogs):
+                dialog.flush_pending()
+            for dialog in list(self._map_dialogs.values()):
+                dialog.flush_pending()
+            for window in list(self._note_windows.values()):
+                window.flush_pending()
+            panel = self.shelf.characters_view()
+            if panel is not None:
+                panel.flush_pending()
+            self.storage.save_settings(self.settings)
+        except Exception as exc:   # noqa: BLE001 - 设置/统计等次要写入失败也要让用户看到
+            ok = False
+            reason = reason or str(exc) or exc.__class__.__name__
+        if not ok:
+            reason = reason or self._last_save_error or "写入失败"
+        return ok, reason
+
+    def _exit_show_success(self) -> None:
+        overlay = self._exit_overlay
+        if overlay is None:
+            return
+        overlay.show_success()
+        # 绿勾停留 0.5 秒，再淡出 220ms，才真正关窗
+        QTimer.singleShot(500, self._exit_fade)
+
+    def _exit_fade(self) -> None:
+        overlay = self._exit_overlay
+        if overlay is None:
+            return
+        overlay.fade_out(self._exit_finish)
+
+    def _exit_finish(self) -> None:
+        overlay = self._exit_overlay
+        self._exit_overlay = None
+        if overlay is not None:
+            overlay.hide_overlay()
+            overlay.deleteLater()
+        self._close_flow_active = False
+        self._close_from_flow = True
+        self.close()
+
+    def _exit_show_error(self, reason: str) -> None:
+        overlay = self._exit_overlay
+        if overlay is None:
+            return
+        overlay.show_error(reason)
+        self._close_flow_active = False   # 等用户决定：重试 / 取消退出
+
+    def _exit_retry(self) -> None:
+        overlay = self._exit_overlay
+        if overlay is None or self._close_flow_active:
+            return
+        self._close_flow_active = True
+        self._exit_started = time.monotonic()
+        overlay.show_saving()
+        QTimer.singleShot(0, self._exit_do_flush)
+
+    def _exit_cancel(self) -> None:
+        overlay = self._exit_overlay
+        self._exit_overlay = None
+        self._close_flow_active = False
+        if overlay is not None:
+            overlay.hide_overlay()
+            overlay.deleteLater()
+        # 用户选择不退出：恢复自动保存与同步定时器，内容仍在编辑器里
+        self._restart_auto_sync_timer()
+        if self._dirty:
+            self.autosave_timer.start()
+
+    def _settle_workers(self, timeout_ms: int = 400) -> None:
+        """关窗前给后台同步线程一个有限的收尾时间，避免无限等待卡住退出。"""
+        workers = (
+            self._webdav_worker,
+            self._webdav_test_worker,
+            self._webdav_create_worker,
+        )
+        for worker in workers:
+            if worker is None or not worker.isRunning():
+                continue
+            worker.requestInterruption()
+            worker.wait(timeout_ms)
+            if worker.isRunning():
+                # 超时仍未结束：脱离主窗口，避免窗口销毁时连带析构运行中的 QThread
+                worker.setParent(None)
+                _ORPHAN_WORKERS.append(worker)
+

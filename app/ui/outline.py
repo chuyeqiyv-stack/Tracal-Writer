@@ -605,16 +605,17 @@ class OutlineCanvas(QWidget):
         node, _handle = self._hit_test(pos)
         if node is None:
             menu = QMenu(self)
-            menu.addAction("新建卡片", lambda: self._add_node(pos - QPointF(40, 18), ""))
+            menu.addAction("新建大纲条目", lambda: self._add_node(pos - QPointF(40, 18), ""))
             menu.exec(event.globalPos())
+            menu.deleteLater()
             return
 
         self._selected_id = str(node.get("id"))
         self.update()
         menu = QMenu(self)
-        menu.addAction("编辑文字", lambda: self._start_edit(node))
-        menu.addAction("添加子卡片", lambda: self._add_child(node))
-        color_menu = menu.addMenu("卡片颜色")
+        menu.addAction("编辑条目文字", lambda: self._start_edit(node))
+        menu.addAction("添加子条目", lambda: self._add_child(node))
+        color_menu = menu.addMenu("条目颜色")
         for value, name in NODE_COLORS:
             action = color_menu.addAction(name)
             action.setIcon(_color_swatch_icon(value, self.theme))
@@ -622,8 +623,9 @@ class OutlineCanvas(QWidget):
                 lambda _c=False, v=value: self._set_color(node, v)
             )
         menu.addSeparator()
-        menu.addAction("删除卡片", lambda: self._delete_node(node))
+        menu.addAction("删除条目", lambda: self._delete_node(node))
         menu.exec(event.globalPos())
+        menu.deleteLater()
 
     # ------------------------------------------------------------------
     # 节点操作

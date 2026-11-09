@@ -4,7 +4,8 @@
 - 书籍：大尺寸 3:4 封面卡片（网格）与列表行，带新作品角标与悬浮阴影；
 - 时间轴 / 设定 / 大纲 / 地图：独立卡片，可创建 / 打开；
 - 成就页：展示已解锁 / 未解锁的勋章；
-- 空白处与卡片右键均提供现代圆角菜单（新建作品 / 新建设定 / 新建时间轴等）。
+- 右键菜单按当前页面与落点适配：空白处只列本页能力，卡片上只列该条目操作，
+  本页没有的能力整项不出现（见 context_menu.make_menu）。
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import time
 
 from app import config
 
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QColor, QCursor, QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
@@ -20,15 +21,18 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from app.services.achievements import ACHIEVEMENTS
 from app.services.word_count import format_word_count
+from app.ui.context_menu import make_menu, popup, submenu
 from app.ui.widgets import AvatarView, CardFrame, CoverView, GlassButton
 
 # 大封面卡片尺寸（封面满铺卡片宽度，3:4 书籍比例）
@@ -44,6 +48,13 @@ def _elide(text: str, width: int, font) -> str:
 
 def _date_text(ts: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(float(ts or 0)))
+
+
+def _time_text(ts: float) -> str:
+    """修改时间（没有时间戳时返回空串，列表视图据此隐藏该列）。"""
+    if not ts:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
 
 
 def _is_new(meta: dict) -> bool:
@@ -64,6 +75,7 @@ class BookCard(CardFrame):
     restore_requested = Signal(str)
     delete_forever_requested = Signal(str)
     export_requested = Signal(str)
+    export_chapters_requested = Signal(str)
 
     def __init__(self, meta: dict, parent=None) -> None:
         super().__init__(parent)
@@ -133,21 +145,25 @@ class BookCard(CardFrame):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
-        menu = QMenu(self)
         if self.in_trash:
-            menu.addAction("恢复作品", lambda: self.restore_requested.emit(self.book_id))
-            menu.addAction("彻底删除", lambda: self.delete_forever_requested.emit(self.book_id))
-            menu.exec(event.globalPos())
-            return
-        menu.addAction("打开作品", lambda: self.open_requested.emit(self.book_id))
-        menu.addAction("重命名", lambda: self.rename_requested.emit(self.book_id))
-        menu.addAction("更换封面…", lambda: self.cover_change_requested.emit(self.book_id))
-        menu.addAction("移动到分组…", lambda: self.move_group_requested.emit(self.book_id))
-        menu.addSeparator()
-        menu.addAction("导出 TXT…", lambda: self.export_requested.emit(self.book_id))
-        menu.addSeparator()
-        menu.addAction("移入回收站", lambda: self.trash_requested.emit(self.book_id))
-        menu.exec(event.globalPos())
+            entries = [
+                ("恢复本书", lambda: self.restore_requested.emit(self.book_id)),
+                ("彻底删除本书", lambda: self.delete_forever_requested.emit(self.book_id)),
+            ]
+        else:
+            entries = [
+                ("打开本书", lambda: self.open_requested.emit(self.book_id)),
+                ("重命名本书", lambda: self.rename_requested.emit(self.book_id)),
+                ("更换本书封面…", lambda: self.cover_change_requested.emit(self.book_id)),
+                ("移动本书到分组…", lambda: self.move_group_requested.emit(self.book_id)),
+                None,
+                ("导出本书（单文件 TXT）…", lambda: self.export_requested.emit(self.book_id)),
+                ("导出整本书（一章一文件）…",
+                 lambda: self.export_chapters_requested.emit(self.book_id)),
+                None,
+                ("删除本书（移入回收站）", lambda: self.trash_requested.emit(self.book_id)),
+            ]
+        popup(make_menu(self, entries), event.globalPos())
 
 
 class BookRow(CardFrame):
@@ -162,6 +178,7 @@ class BookRow(CardFrame):
     restore_requested = Signal(str)
     delete_forever_requested = Signal(str)
     export_requested = Signal(str)
+    export_chapters_requested = Signal(str)
 
     def __init__(self, meta: dict, parent=None) -> None:
         super().__init__(parent)
@@ -232,21 +249,25 @@ class BookRow(CardFrame):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
-        menu = QMenu(self)
         if self.in_trash:
-            menu.addAction("恢复作品", lambda: self.restore_requested.emit(self.book_id))
-            menu.addAction("彻底删除", lambda: self.delete_forever_requested.emit(self.book_id))
-            menu.exec(event.globalPos())
-            return
-        menu.addAction("打开作品", lambda: self.open_requested.emit(self.book_id))
-        menu.addAction("重命名", lambda: self.rename_requested.emit(self.book_id))
-        menu.addAction("更换封面…", lambda: self.cover_change_requested.emit(self.book_id))
-        menu.addAction("移动到分组…", lambda: self.move_group_requested.emit(self.book_id))
-        menu.addSeparator()
-        menu.addAction("导出 TXT…", lambda: self.export_requested.emit(self.book_id))
-        menu.addSeparator()
-        menu.addAction("移入回收站", lambda: self.trash_requested.emit(self.book_id))
-        menu.exec(event.globalPos())
+            entries = [
+                ("恢复本书", lambda: self.restore_requested.emit(self.book_id)),
+                ("彻底删除本书", lambda: self.delete_forever_requested.emit(self.book_id)),
+            ]
+        else:
+            entries = [
+                ("打开本书", lambda: self.open_requested.emit(self.book_id)),
+                ("重命名本书", lambda: self.rename_requested.emit(self.book_id)),
+                ("更换本书封面…", lambda: self.cover_change_requested.emit(self.book_id)),
+                ("移动本书到分组…", lambda: self.move_group_requested.emit(self.book_id)),
+                None,
+                ("导出本书（单文件 TXT）…", lambda: self.export_requested.emit(self.book_id)),
+                ("导出整本书（一章一文件）…",
+                 lambda: self.export_chapters_requested.emit(self.book_id)),
+                None,
+                ("删除本书（移入回收站）", lambda: self.trash_requested.emit(self.book_id)),
+            ]
+        popup(make_menu(self, entries), event.globalPos())
 
 
 class ItemCard(CardFrame):
@@ -257,9 +278,11 @@ class ItemCard(CardFrame):
     rename_requested = Signal(str)
     delete_requested = Signal(str)
 
-    def __init__(self, item_id: str, title: str, subtitle: str, accent: str, parent=None) -> None:
+    def __init__(self, item_id: str, title: str, subtitle: str, accent: str,
+                 parent=None, kind: str = "条目") -> None:
         super().__init__(parent)
         self.item_id = item_id
+        self.kind = kind
         self.setObjectName("ShelfCard")
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedSize(CARD_W, 148)
@@ -287,10 +310,23 @@ class ItemCard(CardFrame):
         self.set_data(title, subtitle)
 
     def set_data(self, title: str, subtitle: str) -> None:
-        font = self.title_label.font()
-        self.title_label.setText(_elide(title, CARD_W - 28, font))
+        self._title_text = title
+        self._sub_text = subtitle
         self.title_label.setToolTip(title)
-        self.sub_label.setText(_elide(subtitle, CARD_W - 28, self.sub_label.font()))
+        self._refresh_elide()
+
+    def _refresh_elide(self) -> None:
+        """摘要按卡片实际宽度截断（列数变化 / 缩放变化后都重新计算）。"""
+        width = max(60, (self.width() or CARD_W) - 28)
+        self.title_label.setText(_elide(getattr(self, "_title_text", ""), width,
+                                        self.title_label.font()))
+        self.sub_label.setText(_elide(getattr(self, "_sub_text", ""), width,
+                                      self.sub_label.font()))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if hasattr(self, "_title_text"):
+            self._refresh_elide()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
@@ -302,12 +338,104 @@ class ItemCard(CardFrame):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
-        menu = QMenu(self)
-        menu.addAction("打开", lambda: self.open_requested.emit(self.item_id))
-        menu.addAction("重命名", lambda: self.rename_requested.emit(self.item_id))
-        menu.addSeparator()
-        menu.addAction("删除", lambda: self.delete_requested.emit(self.item_id))
-        menu.exec(event.globalPos())
+        kind = self.kind
+        entries = [(f"打开{kind}", lambda: self.open_requested.emit(self.item_id))]
+        if getattr(self, "can_rename", True):
+            entries.append((f"重命名{kind}", lambda: self.rename_requested.emit(self.item_id)))
+        if getattr(self, "can_delete", True):
+            entries.append(None)
+            entries.append((f"删除{kind}", lambda: self.delete_requested.emit(self.item_id)))
+        popup(make_menu(self, entries), event.globalPos())
+
+
+class NoteRow(CardFrame):
+    """设定页列表视图的一行：标题 / 摘要 / 修改时间。"""
+
+    clicked = Signal(str)
+    open_requested = Signal(str)
+    rename_requested = Signal(str)
+    delete_requested = Signal(str)
+
+    def __init__(self, item_id: str, title: str, summary: str, updated: str,
+                 accent: str, parent=None, kind: str = "条目") -> None:
+        super().__init__(parent)
+        self.item_id = item_id
+        self.kind = kind
+        self.setObjectName("ShelfCard")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(58)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._title_text = title
+        self._sub_text = summary
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 10, 16, 10)
+        row.setSpacing(14)
+
+        self.strip = QFrame(self)
+        self.strip.setFixedSize(4, 24)
+        self.strip.setStyleSheet(f"background:{accent};border-radius:2px;")
+        row.addWidget(self.strip)
+
+        self.title_label = QLabel(self)
+        self.title_label.setObjectName("CardTitle")
+        self.title_label.setFixedWidth(180)
+        row.addWidget(self.title_label)
+
+        self.sub_label = QLabel(self)
+        self.sub_label.setObjectName("CardSummary")
+        self.sub_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        row.addWidget(self.sub_label, 1)
+
+        self.time_label = QLabel(updated, self)
+        self.time_label.setObjectName("CardSummary")
+        self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.time_label.setFixedWidth(124)
+        self.time_label.setVisible(bool(updated))
+        row.addWidget(self.time_label)
+
+        self._refresh_elide()
+
+    def set_data(self, title: str, summary: str, updated: str) -> None:
+        """就地更新一行（保存设定后只改这一条，不重建整页）。"""
+        self._title_text = title
+        self._sub_text = summary
+        self.time_label.setText(updated)
+        self.time_label.setVisible(bool(updated))
+        self._refresh_elide()
+
+    def _refresh_elide(self) -> None:
+        tw = self.title_label.width() or 180
+        self.title_label.setText(_elide(self._title_text, max(60, tw - 4),
+                                       self.title_label.font()))
+        self.title_label.setToolTip(self._title_text)
+        sw = self.sub_label.width() or 400
+        self.sub_label.setText(_elide(self._sub_text, max(60, sw - 8),
+                                      self.sub_label.font()))
+        self.sub_label.setToolTip(self._sub_text)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._refresh_elide()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.item_id)
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        self.open_requested.emit(self.item_id)
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        kind = self.kind
+        entries = [(f"打开{kind}", lambda: self.open_requested.emit(self.item_id))]
+        if getattr(self, "can_rename", True):
+            entries.append((f"重命名{kind}", lambda: self.rename_requested.emit(self.item_id)))
+        if getattr(self, "can_delete", True):
+            entries.append(None)
+            entries.append((f"删除{kind}", lambda: self.delete_requested.emit(self.item_id)))
+        popup(make_menu(self, entries), event.globalPos())
 
 
 class AchievementCard(CardFrame):
@@ -322,6 +450,7 @@ class AchievementCard(CardFrame):
                  showcase_key: str = "", parent=None) -> None:
         super().__init__(parent)
         self.ach_key = key
+        self.info = dict(info or {})
         self.unlocked = unlocked_ts > 0
         self.showcase_key = str(showcase_key or "")
         self.setObjectName("ShelfCard")
@@ -374,16 +503,29 @@ class AchievementCard(CardFrame):
         else:
             self.desc_label.setText(f"未解锁 · {info.get('cond') or ''}")
 
+    def _show_details(self) -> None:
+        from app.ui.dialogs import MessageBox
+
+        info = self.info
+        state = "已解锁" if self.unlocked else "未解锁"
+        MessageBox.information(
+            self,
+            f"成就 · {info.get('name') or self.ach_key}",
+            f"{info.get('sub') or ''}\n\n条件：{info.get('cond') or ''}\n状态：{state}",
+        )
+
     def contextMenuEvent(self, event) -> None:  # noqa: N802
-        """右键已解锁成就：设为展示 / 卸下展示勋章。"""
-        if not self.unlocked:
-            return
-        menu = QMenu(self)
-        if self.showcase_key == self.ach_key:
-            menu.addAction("卸下展示勋章", lambda: self.showcase_requested.emit(""))
-        else:
-            menu.addAction("设为展示勋章", lambda: self.showcase_requested.emit(self.ach_key))
-        menu.exec(event.globalPos())
+        """右键成就：查看详情 + 已解锁时可设为展示 / 卸下展示勋章。"""
+        entries = [("查看成就详情", self._show_details)]
+        if self.unlocked:
+            entries.append(None)
+            if self.showcase_key == self.ach_key:
+                entries.append(("卸下展示勋章",
+                                lambda: self.showcase_requested.emit("")))
+            else:
+                entries.append(("设为展示勋章",
+                                lambda: self.showcase_requested.emit(self.ach_key)))
+        popup(make_menu(self, entries), event.globalPos())
 
 
 class ShelfNav(QFrame):
@@ -658,6 +800,7 @@ class BookshelfPage(QWidget):
     delete_group_requested = Signal(str)
     move_group_requested = Signal(str)
     view_changed = Signal(str)
+    notes_view_changed = Signal(str)
     profile_edit_requested = Signal()
     avatar_import_requested = Signal()
 
@@ -687,6 +830,7 @@ class BookshelfPage(QWidget):
     rename_map_requested = Signal(str)
     delete_map_requested = Signal(str)
     export_book_requested = Signal(str)
+    export_book_chapters_requested = Signal(str)
 
     # 导入（软件导出的同类型文件）
     import_book_requested = Signal()
@@ -697,6 +841,8 @@ class BookshelfPage(QWidget):
 
     # 书架主页「统计」页：打开完整统计窗口
     stats_open_requested = Signal()
+    # 书架刷新（重新读取本机书目后重建页面）
+    refresh_requested = Signal()
 
     # 成就勋章展示（成就页右键已解锁成就触发；空串 = 卸下）
     medal_showcase_requested = Signal(str)
@@ -706,6 +852,26 @@ class BookshelfPage(QWidget):
         self._page = "home"
         self._group = ""
         self._view = "grid"
+        self._notes_view = "grid"
+        self._notes_query = ""
+        self._sort_mode = "created"
+        self._ach_filter = "all"
+        self._notes_timer = QTimer(self)
+        self._notes_timer.setSingleShot(True)
+        self._notes_timer.setInterval(180)
+        self._notes_timer.timeout.connect(self._render)
+        self._grid_cards: list = []
+        self._grid_cols = 0
+        self._grid_rows = 0
+        self._reflow_timer = QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.setInterval(120)
+        self._reflow_timer.timeout.connect(self._reflow_grid)
+        self._pending_scroll_frac: float | None = None
+        self._batch_depth = 0
+        self._batch_dirty = False
+        self._selected_note_id = ""
+        self._new_note_id = ""
         self._metas: list[dict] = []
         self._groups: list[dict] = []
         self._cover_paths: dict[str, str] = {}
@@ -745,14 +911,24 @@ class BookshelfPage(QWidget):
         header.addLayout(text_box)
         header.addStretch(1)
 
+        self.notes_search = QLineEdit(self)
+        self.notes_search.setObjectName("ShelfSearch")
+        self.notes_search.setPlaceholderText("搜索设定标题 / 内容")
+        self.notes_search.setClearButtonEnabled(True)
+        self.notes_search.setFixedWidth(196)
+        self.notes_search.hide()
+        self.notes_search.textChanged.connect(self._on_notes_search)
+        header.addWidget(self.notes_search)
+        header.addSpacing(8)
+
         self.grid_chip = QPushButton("网格", self)
         self.grid_chip.setObjectName("ViewChip")
         self.grid_chip.setCheckable(True)
         self.list_chip = QPushButton("列表", self)
         self.list_chip.setObjectName("ViewChip")
         self.list_chip.setCheckable(True)
-        self.grid_chip.clicked.connect(lambda: self.set_view("grid"))
-        self.list_chip.clicked.connect(lambda: self.set_view("list"))
+        self.grid_chip.clicked.connect(lambda: self._on_view_chip("grid"))
+        self.list_chip.clicked.connect(lambda: self._on_view_chip("list"))
         header.addWidget(self.grid_chip)
         header.addWidget(self.list_chip)
         header.addSpacing(8)
@@ -834,12 +1010,31 @@ class BookshelfPage(QWidget):
         self.nav.refresh_groups(groups)
         self._render()
 
+    def begin_batch(self) -> None:
+        """开始批量刷新：期间的 set_* 只记脏、不重建页面。"""
+        self._batch_depth += 1
+
+    def end_batch(self) -> None:
+        """结束批量：计数归零后统一重建一次（调用方需 try/finally 保证执行）。"""
+        if self._batch_depth > 0:
+            self._batch_depth -= 1
+        if self._batch_depth == 0 and self._batch_dirty:
+            self._batch_dirty = False
+            self._render()
+
     def set_timelines(self, items: list[dict]) -> None:
         self._timelines = items
         self._render()
 
     def set_notes(self, items: list[dict]) -> None:
-        self._notes = items
+        old_ids = {str(n.get("id")) for n in self._notes}
+        self._notes = list(items or [])
+        new_ids = [str(n.get("id")) for n in self._notes if str(n.get("id")) not in old_ids]
+        if self._page == "notes" and len(new_ids) == 1:
+            # 新建后自动定位到新条目（新条目按更新时间排在最前）
+            self._new_note_id = new_ids[0]
+            self._selected_note_id = self._new_note_id
+            self._pending_scroll_frac = 0.0
         self._render()
 
     def set_outlines(self, items: list[dict]) -> None:
@@ -881,13 +1076,47 @@ class BookshelfPage(QWidget):
 
     def set_view(self, view: str) -> None:
         self._view = view if view in {"grid", "list"} else "grid"
-        self.grid_chip.setChecked(self._view == "grid")
-        self.list_chip.setChecked(self._view == "list")
+        self._sync_view_chips()
         self.view_changed.emit(self._view)
         self._render()
 
+    # ------------------------------------------------------------------
+    # 设定页：卡片 / 列表视图切换
+    # ------------------------------------------------------------------
+    def set_notes_view(self, view: str) -> None:
+        """切换设定页视图；记住偏好并保住当前滚动位置与选中项。"""
+        view = view if view in {"grid", "list"} else "grid"
+        if view == self._notes_view:
+            self._sync_view_chips()
+            return
+        sb = self.scroll.verticalScrollBar()
+        self._pending_scroll_frac = sb.value() / sb.maximum() if sb.maximum() else 0.0
+        self._notes_view = view
+        self._sync_view_chips()
+        if self._page == "notes":
+            self._render()
+        self.notes_view_changed.emit(view)
+
+    def _on_view_chip(self, view: str) -> None:
+        if self._page == "notes":
+            self.set_notes_view(view)
+        else:
+            self.set_view(view)
+
+    def _sync_view_chips(self) -> None:
+        current = self._notes_view if self._page == "notes" else self._view
+        self.grid_chip.setChecked(current == "grid")
+        self.list_chip.setChecked(current == "list")
+
+    def _on_notes_search(self, text: str) -> None:
+        self._notes_query = str(text or "")
+        self._notes_timer.start()
+
     def _on_page_changed(self, page: str) -> None:
         self._page = page
+        self._pending_scroll_frac = 0.0      # 换页回顶部
+        self._selected_note_id = ""
+        self._new_note_id = ""
         self._render()
         # 统计页不自动弹窗：由页面里的「打字统计」卡片左键打开完整统计
 
@@ -926,10 +1155,18 @@ class BookshelfPage(QWidget):
             items = [m for m in items if not m.get("trashed")]
             if self._group:
                 items = [m for m in items if m.get("group_id") == self._group]
-            items = sorted(items, key=lambda m: float(m.get("created_at") or 0), reverse=True)
+            if self._sort_mode == "updated":
+                items.sort(key=lambda m: float(m.get("updated_at") or 0), reverse=True)
+            elif self._sort_mode == "title":
+                items.sort(key=lambda m: str(m.get("title") or ""))
+            else:
+                items.sort(key=lambda m: float(m.get("created_at") or 0), reverse=True)
         return items
 
     def _render(self) -> None:
+        if self._batch_depth > 0:
+            self._batch_dirty = True
+            return
         # 离开角色页时隐藏角色面板
         if self._characters_panel is not None and self._page != "characters":
             self._characters_panel.hide()
@@ -961,7 +1198,13 @@ class BookshelfPage(QWidget):
         elif self._page == "outline":
             self.subtitle_label.setText(f"共 {len(self._outlines)} 张大纲思维导图 · 点击卡片打开")
         elif self._page == "notes":
-            self.subtitle_label.setText(f"共 {len(self._notes)} 篇设定文档 · 点击卡片打开")
+            if self._notes_query.strip():
+                shown = len(self._notes_for_view())
+                self.subtitle_label.setText(
+                    f"共 {len(self._notes)} 篇设定文档 · 命中 {shown} 条"
+                )
+            else:
+                self.subtitle_label.setText(f"共 {len(self._notes)} 篇设定文档 · 点击卡片打开")
         elif self._page == "characters":
             self.subtitle_label.setText(
                 f"共 {len(self._characters)} 名角色 · {len(self._character_relations)} 条关系 · 顶部可切换「关系图」视图"
@@ -990,10 +1233,13 @@ class BookshelfPage(QWidget):
                 f"共 {all_count} 本作品 · {format_word_count(total_words)} 字 · 数据保存在本机"
             )
 
-        # 书籍页面才显示视图切换与「新建作品」按钮；回收站页显示清空按钮
+        # 书籍页面与设定页都显示视图切换；设定页额外显示搜索框
         is_book_page = self._page in {"home", "trash", "discover"}
-        self.grid_chip.setVisible(is_book_page)
-        self.list_chip.setVisible(is_book_page)
+        is_notes_page = self._page == "notes"
+        self.grid_chip.setVisible(is_book_page or is_notes_page)
+        self.list_chip.setVisible(is_book_page or is_notes_page)
+        self.notes_search.setVisible(is_notes_page)
+        self._sync_view_chips()
         if self._page != "trash":
             self.empty_trash_button.hide()
         if self._page == "timeline":
@@ -1011,6 +1257,9 @@ class BookshelfPage(QWidget):
         self.new_button.setVisible(self._page not in ("achievements", "stats"))
 
         # 清空旧卡片（立即隐藏避免删除延迟期间的残影）
+        sb = self.scroll.verticalScrollBar()
+        frac = (self._pending_scroll_frac if self._pending_scroll_frac is not None
+                else (sb.value() / sb.maximum() if sb.maximum() else 0.0))
         for layout in (self.grid, self.list_box):
             while layout.count():
                 item = layout.takeAt(0)
@@ -1018,6 +1267,10 @@ class BookshelfPage(QWidget):
                 if widget is not None:
                     widget.hide()
                     widget.deleteLater()
+        self._grid_cards = []
+        self._grid_cols = 0
+        self._grid_rows = 0
+        self._note_widgets: dict[str, QWidget] = {}
 
         if self._page == "timeline":
             self._render_timelines()
@@ -1027,6 +1280,7 @@ class BookshelfPage(QWidget):
             return
         if self._page == "notes":
             self._render_notes()
+            self._apply_scroll(frac)
             return
         if self._page == "characters":
             self._render_characters()
@@ -1058,21 +1312,23 @@ class BookshelfPage(QWidget):
             self._fill_grid(items)
         else:
             self._fill_list(items)
+        self._apply_scroll(frac)
 
     def _cover_path_for(self, meta: dict) -> str:
         return self._cover_paths.get(str(meta.get("id") or ""), "")
 
     def _columns(self) -> int:
-        """根据当前可视宽度自适应列数（大卡片通常 4~5 列）。"""
+        """按可用宽度自适应列数：窄窗自动减列，宽窗增加列。"""
         try:
             width = self.scroll.viewport().width()
         except RuntimeError:
             width = 1000
-        return max(3, (width - 20) // (CARD_W + 18))
+        return max(1, (width - 20) // (CARD_W + 18))
 
     def _fill_grid(self, items: list[dict]) -> None:
         columns = self._columns()
         in_trash = self._page == "trash"
+        cards = []
         for index, meta in enumerate(items):
             card = BookCard(meta, self.grid_holder)
             card.set_meta(meta, self._cover_path_for(meta))
@@ -1080,10 +1336,13 @@ class BookshelfPage(QWidget):
             self._connect_card(card)
             row, col = divmod(index, columns)
             self.grid.addWidget(card, row, col)
+            cards.append(card)
         for col in range(columns):
             self.grid.setColumnStretch(col, 1)
         rows = (len(items) - 1) // columns + 1
         self.grid.setRowStretch(rows, 1)
+        self._grid_cards = cards
+        self._grid_cols, self._grid_rows = columns, rows
 
     def _fill_list(self, items: list[dict]) -> None:
         in_trash = self._page == "trash"
@@ -1108,6 +1367,8 @@ class BookshelfPage(QWidget):
         rows = (len(cards) - 1) // columns + 1 if cards else 0
         if rows:
             self.grid.setRowStretch(rows, 1)
+        self._grid_cards = list(cards)
+        self._grid_cols, self._grid_rows = columns, rows
 
     def _render_timelines(self) -> None:
         if not self._timelines:
@@ -1126,6 +1387,7 @@ class BookshelfPage(QWidget):
                 f"{count} 个事件 · 更新于 {_date_text(float(item.get('updated_at') or 0))}",
                 "#17B26A",
                 self.grid_holder,
+                kind="时间轴",
             )
             card.clicked.connect(self.open_timeline_requested.emit)
             card.open_requested.connect(self.open_timeline_requested.emit)
@@ -1151,6 +1413,7 @@ class BookshelfPage(QWidget):
                 f"{count} 个节点 · 更新于 {_date_text(float(item.get('updated_at') or 0))}",
                 "#9A6BF0",
                 self.grid_holder,
+                kind="大纲",
             )
             card.clicked.connect(self.open_outline_requested.emit)
             card.open_requested.connect(self.open_outline_requested.emit)
@@ -1216,6 +1479,7 @@ class BookshelfPage(QWidget):
                 f"{factions} 个势力 · {pins} 个点位 · 更新于 {_date_text(float(item.get('updated_at') or 0))}",
                 "#E0A23F",
                 self.grid_holder,
+                kind="地图",
             )
             card.clicked.connect(self.open_map_requested.emit)
             card.open_requested.connect(self.open_map_requested.emit)
@@ -1232,7 +1496,10 @@ class BookshelfPage(QWidget):
             "累计字数 · 每日日历 · 点击查看",
             "#21A575",
             self.grid_holder,
+            kind="打字统计",
         )
+        card.can_rename = False
+        card.can_delete = False
         # clicked/open_requested 带 item_id 参数，stats_open_requested 无参——
         # 必须经 lambda 转发（直连会在真实点击时抛 TypeError 导致卡片点不开统计）
         card.clicked.connect(lambda _item_id="": self.stats_open_requested.emit())
@@ -1240,42 +1507,232 @@ class BookshelfPage(QWidget):
         self._fill_item_grid([card])
 
     def _render_achievements(self) -> None:
+        pairs = [
+            (key, info)
+            for key, info in ACHIEVEMENTS.items()
+            if self._ach_filter == "all"
+            or (self._ach_filter == "unlocked") == (key in self._unlocked)
+        ]
+        if not pairs:
+            self.empty_label.setText("没有符合条件的成就\n右键空白处切换筛选条件")
+            self.grid_holder.hide()
+            self.empty_label.show()
+            return
+        self.empty_label.hide()
         cards = [
             AchievementCard(
                 key, info, float(self._unlocked.get(key) or 0), self._showcase,
                 self.grid_holder,
             )
-            for key, info in ACHIEVEMENTS.items()
+            for key, info in pairs
         ]
         for card in cards:
             card.showcase_requested.connect(self.medal_showcase_requested.emit)
         self._fill_item_grid(cards)
 
     def _render_notes(self) -> None:
-        if not self._notes:
+        items = self._notes_for_view()
+        if not items:
             self.scroll.hide()
-            self.empty_label.setText("还没有设定文档\n右键空白处选择「新建设定」")
+            if self._notes_query.strip():
+                self.empty_label.setText("没有匹配的设定\n换个关键词试试，或清空搜索框")
+            else:
+                self.empty_label.setText("还没有设定文档\n右键空白处选择「新建设定」")
             self.empty_label.show()
             return
-        cards: list[ItemCard] = []
-        for item in sorted(
-            self._notes, key=lambda n: float(n.get("updated_at") or 0), reverse=True
-        ):
-            content = " ".join(str(item.get("content") or "").split())[:40]
-            subtitle = content or f"更新于 {_date_text(float(item.get('updated_at') or 0))}"
-            card = ItemCard(
+        self.empty_label.hide()
+        self.scroll.show()
+        if self._notes_view == "grid":
+            self.grid_holder.setVisible(True)
+            self.list_holder.setVisible(False)
+            cards: list[ItemCard] = []
+            for item in items:
+                subtitle = self._note_subtitle(item)
+                card = ItemCard(
+                    str(item.get("id")),
+                    str(item.get("title") or "未命名设定"),
+                    subtitle,
+                    "#5B8DEF",
+                    self.grid_holder,
+                    kind="设定",
+                )
+                card.clicked.connect(self._on_note_clicked)
+                card.open_requested.connect(self.open_note_requested.emit)
+                card.rename_requested.connect(self.rename_note_requested.emit)
+                card.delete_requested.connect(self.delete_note_requested.emit)
+                cards.append(card)
+                self._note_widgets[card.item_id] = card
+            self._fill_item_grid(cards)
+            return
+        # 列表视图：一行一篇，标题 / 摘要 / 修改时间
+        self.grid_holder.setVisible(False)
+        self.list_holder.setVisible(True)
+        for item in items:
+            summary = " ".join(str(item.get("content") or "").split())[:90]
+            row = NoteRow(
                 str(item.get("id")),
                 str(item.get("title") or "未命名设定"),
-                subtitle,
+                summary,
+                _time_text(float(item.get("updated_at") or 0)),
                 "#5B8DEF",
-                self.grid_holder,
+                self.list_holder,
+                kind="设定",
             )
-            card.clicked.connect(self.open_note_requested.emit)
-            card.open_requested.connect(self.open_note_requested.emit)
-            card.rename_requested.connect(self.rename_note_requested.emit)
-            card.delete_requested.connect(self.delete_note_requested.emit)
-            cards.append(card)
-        self._fill_item_grid(cards)
+            row.clicked.connect(self._on_note_clicked)
+            row.open_requested.connect(self.open_note_requested.emit)
+            row.rename_requested.connect(self.rename_note_requested.emit)
+            row.delete_requested.connect(self.delete_note_requested.emit)
+            self.list_box.addWidget(row)
+            self._note_widgets[row.item_id] = row
+
+    def _notes_for_view(self) -> list[dict]:
+        items = sorted(self._notes,
+                       key=lambda n: float(n.get("updated_at") or 0), reverse=True)
+        q = self._notes_query.strip().lower()
+        if q:
+            items = [n for n in items
+                     if q in str(n.get("title") or "").lower()
+                     or q in str(n.get("content") or "").lower()]
+        return items
+
+    @staticmethod
+    def _note_subtitle(item: dict, limit: int = 40) -> str:
+        """卡片摘要：正文前 N 字；正文为空时退回更新时间。"""
+        content = " ".join(str(item.get("content") or "").split())[:limit]
+        return content or f"更新于 {_date_text(float(item.get('updated_at') or 0))}"
+
+    def update_note(self, doc: dict) -> None:
+        """保存设定后就地更新该条目，不重建整页。
+
+        排序（或搜索命中）导致位置变化时只移动这一条；筛选结果可能增减时退回整页刷新。
+        """
+        note_id = str(doc.get("id") or "")
+        if not note_id:
+            return
+        target = None
+        for item in self._notes:
+            if str(item.get("id")) == note_id:
+                target = item
+                break
+        if target is None:
+            target = dict(doc)
+            self._notes.append(target)
+        else:
+            target.update(dict(doc))
+        if self._page != "notes":
+            return
+        if self._notes_query.strip() or note_id not in self._note_widgets:
+            # 有搜索词时该条可能从命中集增删，列表长度会变 → 只能整页刷新
+            self._render()
+            return
+        widget = self._note_widgets[note_id]
+        title = str(target.get("title") or "未命名设定")
+        if self._notes_view == "grid":
+            widget.set_data(title, self._note_subtitle(target))
+        else:
+            summary = " ".join(str(target.get("content") or "").split())[:90]
+            widget.set_data(title, summary,
+                            _time_text(float(target.get("updated_at") or 0)))
+        self._move_note_widget(note_id)
+
+    def _move_note_widget(self, note_id: str) -> None:
+        """按当前排序仅移动/重排受影响的这一条，不重建卡片。"""
+        order = [str(n.get("id")) for n in self._notes_for_view()]
+        if note_id not in order:
+            return
+        new_index = order.index(note_id)
+        widget = self._note_widgets.get(note_id)
+        if widget is None:
+            return
+        if self._notes_view == "list":
+            current = self.list_box.indexOf(widget)
+            if current >= 0 and current != new_index:
+                self.list_box.removeWidget(widget)
+                self.list_box.insertWidget(new_index, widget)
+            return
+        index = self.grid.indexOf(widget)
+        if index < 0 or not self._grid_cols:
+            return
+        row, col, _rs, _cs = self.grid.getItemPosition(index)
+        old_index = row * self._grid_cols + col
+        if old_index == new_index:
+            return
+        cards = list(self._grid_cards)
+        ids = [str(getattr(c, "item_id", "")) for c in cards]
+        if note_id not in ids:
+            return
+        moved = cards.pop(old_index)
+        cards.insert(new_index, moved)
+        self._grid_cards = cards
+        # 只把 [start:] 的现有控件重新入格（不新建），前面的卡片完全不动
+        start = min(old_index, new_index)
+        for card in cards[start:]:
+            self.grid.removeWidget(card)
+        for i in range(start, len(cards)):
+            new_row, new_col = divmod(i, self._grid_cols)
+            self.grid.addWidget(cards[i], new_row, new_col)
+
+    def _on_note_clicked(self, note_id: str) -> None:
+        self._selected_note_id = str(note_id)
+        self._new_note_id = ""
+        self.open_note_requested.emit(note_id)
+
+    def _apply_scroll(self, frac: float | None) -> None:
+        """渲染完成后恢复滚动位置与选中项（等布局刷新后再设值）。"""
+        self._pending_scroll_frac = None
+        page_at_call = self._page
+
+        def restore() -> None:
+            if self._page != page_at_call:
+                return
+            sb = self.scroll.verticalScrollBar()
+            if frac and sb.maximum() > 0:
+                sb.setValue(int(round(frac * sb.maximum())))
+            self._apply_note_selection()
+
+        QTimer.singleShot(0, restore)
+
+    def _apply_note_selection(self) -> None:
+        if self._page != "notes":
+            return
+        target = self._new_note_id or self._selected_note_id
+        widget = self._note_widgets.get(str(target)) if target else None
+        if widget is None:
+            return
+        for w in self._note_widgets.values():
+            w.set_selected(w is widget)
+        if self._new_note_id:
+            self.scroll.ensureWidgetVisible(widget, 8, 8)
+            self._new_note_id = ""
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._reflow_timer.start()
+
+    def _reflow_grid(self) -> None:
+        """窗口变宽/变窄时按新列数重排现有卡片，不重建、不打断滚动。"""
+        if not self._grid_cards or not self.grid_holder.isVisible():
+            return
+        if self._page == "notes" and self._notes_view != "grid":
+            return
+        cols = self._columns()
+        if cols == self._grid_cols:
+            return
+        sb = self.scroll.verticalScrollBar()
+        frac = sb.value() / sb.maximum() if sb.maximum() else 0.0
+        for c in range(self._grid_cols + 1):
+            self.grid.setColumnStretch(c, 0)
+        for r in range(self._grid_rows + 1):
+            self.grid.setRowStretch(r, 0)
+        for i, card in enumerate(self._grid_cards):
+            row, col = divmod(i, cols)
+            self.grid.addWidget(card, row, col)
+        for c in range(cols):
+            self.grid.setColumnStretch(c, 1)
+        rows = (len(self._grid_cards) - 1) // cols + 1
+        self.grid.setRowStretch(rows, 1)
+        self._grid_cols, self._grid_rows = cols, rows
+        self._apply_scroll(frac)
 
     def _connect_card(self, card) -> None:
         card.open_requested.connect(self.open_book_requested.emit)
@@ -1287,34 +1744,146 @@ class BookshelfPage(QWidget):
         card.restore_requested.connect(self.restore_book_requested.emit)
         card.delete_forever_requested.connect(self.delete_forever_requested.emit)
         card.export_requested.connect(self.export_book_requested.emit)
+        card.export_chapters_requested.connect(self.export_book_chapters_requested.emit)
 
     # ------------------------------------------------------------------
-    # 右键菜单
+    # 右键菜单：按当前页面 + 落点给菜单，本页没有的能力整项不出现
     # ------------------------------------------------------------------
     def contextMenuEvent(self, event) -> None:  # noqa: N802
-        menu = QMenu(self)
-        menu.addAction("新建作品", self.new_book_requested.emit)
-        menu.addAction("新建设定", self.new_note_requested.emit)
-        menu.addAction("新建时间轴", self.new_timeline_requested.emit)
-        menu.addAction("新建大纲", self.new_outline_requested.emit)
-        menu.addAction("新建角色", self.new_character_requested.emit)
-        menu.addAction("新建地图", self.new_map_requested.emit)
-        menu.addSeparator()
-        import_menu = menu.addMenu("导入文件…")
-        import_menu.addAction("导入小说 TXT…", self.import_book_requested.emit)
-        import_menu.addAction("导入设定 TXT…", self.import_note_requested.emit)
-        import_menu.addAction("导入时间轴 JSON…", self.import_timeline_requested.emit)
-        import_menu.addAction("导入大纲 JSON…", self.import_outline_requested.emit)
-        import_menu.addAction("导入角色 JSON…", self.import_characters_requested.emit)
-        import_menu.addAction("导入地图底图…", self.import_map_requested.emit)
-        menu.addSeparator()
-        menu.addAction("新建分组", self.new_group_requested.emit)
-        if self._page in {"home", "trash"}:
-            menu.addSeparator()
-            grid_action = menu.addAction("网格视图", lambda: self.set_view("grid"))
-            list_action = menu.addAction("列表视图", lambda: self.set_view("list"))
-            grid_action.setCheckable(True)
-            list_action.setCheckable(True)
-            grid_action.setChecked(self._view == "grid")
-            list_action.setChecked(self._view == "list")
-        menu.exec(event.globalPos())
+        popup(make_menu(self, self._blank_menu_entries()), event.globalPos())
+
+    def _blank_menu_entries(self) -> list:
+        page = self._page
+        if page == "home":
+            export_menu = self._export_books_submenu()
+            entries = [
+                ("新建书", self.new_book_requested.emit),
+                ("导入书（TXT）…", self.import_book_requested.emit),
+            ]
+            if export_menu is not None:
+                entries.append(("导出整本书", export_menu))
+            entries += [
+                ("排序方式", self._sort_submenu()),
+                None,
+                ("刷新书架", self.refresh_requested.emit),
+                ("新建分组", self.new_group_requested.emit),
+            ]
+            return entries
+        if page == "trash":
+            entries = [("刷新回收站", self.refresh_requested.emit)]
+            if any(meta.get("trashed") for meta in self._metas):
+                entries.append(("清空回收站", self.empty_trash_requested.emit))
+            return entries
+        if page == "timeline":
+            return [
+                ("新建时间轴", self.new_timeline_requested.emit),
+                ("导入时间轴（JSON）…", self.import_timeline_requested.emit),
+                None,
+                ("刷新时间轴列表", self.refresh_requested.emit),
+            ]
+        if page == "outline":
+            return [
+                ("新建大纲", self.new_outline_requested.emit),
+                ("导入大纲（JSON）…", self.import_outline_requested.emit),
+                None,
+                ("刷新大纲列表", self.refresh_requested.emit),
+            ]
+        if page == "notes":
+            return [
+                ("新建设定文档", self.new_note_requested.emit),
+                ("导入设定（TXT）…", self.import_note_requested.emit),
+                None,
+                ("搜索设定", self._focus_notes_search),
+                ("网格视图", lambda: self.set_notes_view("grid"),
+                 self._notes_view == "grid"),
+                ("列表视图", lambda: self.set_notes_view("list"),
+                 self._notes_view == "list"),
+            ]
+        if page == "characters":
+            return [
+                ("新建角色卡", self.new_character_requested.emit),
+                ("导入角色（JSON）…", self.import_characters_requested.emit),
+                None,
+                ("角色列表", lambda: self._set_character_view("list")),
+                ("角色关系图", lambda: self._set_character_view("board")),
+            ]
+        if page == "map":
+            return [
+                ("新建地图", self.new_map_requested.emit),
+                ("导入地图图片…", self.import_map_requested.emit),
+                None,
+                ("刷新地图列表", self.refresh_requested.emit),
+            ]
+        if page == "achievements":
+            return [
+                ("查看成就详情…", self._show_achievements_summary),
+                ("筛选成就", self._achievement_filter_submenu()),
+            ]
+        if page == "stats":
+            return [("打开打字统计", self.stats_open_requested.emit)]
+        return []
+
+    def _export_books_submenu(self):
+        """空白处导出整本书：先按书名列出可导出的书，避免没有宾语的「导出」。"""
+        books = [meta for meta in self._metas if not meta.get("trashed")]
+        if not books:
+            return None
+        books.sort(key=lambda m: float(m.get("created_at") or 0), reverse=True)
+        return submenu(self, "导出整本书", [
+            (str(meta.get("title") or "未命名"),
+             lambda bid=str(meta.get("id") or ""):
+             self.export_book_chapters_requested.emit(bid))
+            for meta in books
+        ])
+
+    def _sort_submenu(self):
+        labels = (("created", "按创建时间"), ("updated", "按更新时间"), ("title", "按书名"))
+        return submenu(self, "排序方式", [
+            (label, lambda mode=key: self._set_sort_mode(mode),
+             self._sort_mode == key)
+            for key, label in labels
+        ])
+
+    def _achievement_filter_submenu(self):
+        return submenu(self, "筛选成就", [
+            ("全部成就", lambda: self._set_achievement_filter("all"),
+             self._ach_filter == "all"),
+            ("只看已解锁", lambda: self._set_achievement_filter("unlocked"),
+             self._ach_filter == "unlocked"),
+            ("只看未解锁", lambda: self._set_achievement_filter("locked"),
+             self._ach_filter == "locked"),
+        ])
+
+    def _set_sort_mode(self, mode: str) -> None:
+        if mode not in {"created", "updated", "title"} or mode == self._sort_mode:
+            return
+        self._sort_mode = mode
+        self._render()
+
+    def _set_achievement_filter(self, mode: str) -> None:
+        if mode not in {"all", "unlocked", "locked"} or mode == self._ach_filter:
+            return
+        self._ach_filter = mode
+        self._render()
+
+    def _set_character_view(self, key: str) -> None:
+        panel = self.characters_view()
+        if panel is not None:
+            panel._set_view(key)
+
+    def _focus_notes_search(self) -> None:
+        self.notes_search.setFocus(Qt.OtherFocusReason)
+        self.notes_search.selectAll()
+
+    def _show_achievements_summary(self) -> None:
+        from app.ui.dialogs import MessageBox
+
+        unlocked = len(self._unlocked)
+        lines = [
+            f"{'已解锁' if key in self._unlocked else '未解锁'} · "
+            f"{info.get('name') or ''}：{info.get('cond') or ''}"
+            for key, info in ACHIEVEMENTS.items()
+        ]
+        MessageBox.information(
+            self, "成就详情", f"已解锁 {unlocked} / {len(ACHIEVEMENTS)} 枚\n\n" + "\n".join(lines)
+        )

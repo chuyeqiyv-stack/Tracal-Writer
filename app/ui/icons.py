@@ -41,6 +41,7 @@ ICON_NAMES = [
     "dots", "home", "discover", "grid", "list", "timeline", "palette",
     "image", "group", "user", "cloud", "upload", "download", "mind",
     "left", "right", "map", "medal", "check", "help",
+    "focus", "proofread",
 ]
 
 # 模块级位图缓存：argb 颜色 + 名字 + 逻辑尺寸 + DPR + 状态 -> QPixmap
@@ -557,6 +558,25 @@ def _draw(p: QPainter, ink: QColor, name: str) -> None:  # noqa: C901 - 纯分�
         def dot(q):
             q.drawEllipse(QPointF(12.1, 16.6), 0.95, 0.95)
         _fill(p, ink, dot)
+
+    # -------------------------------------------------------------- 专注/体检（新增）
+    elif name == "focus":
+        # 四角取景框 + 中心点：进入沉浸取景
+        for x, y, dx, dy in ((5, 5, 1, 1), (19, 5, -1, 1),
+                             (5, 19, 1, -1), (19, 19, -1, -1)):
+            _line(p, x, y, x + dx * 4.5, y)
+            _line(p, x, y, x, y + dy * 4.5)
+
+        def focus_dot(q):
+            q.drawEllipse(QPointF(12, 12), 1.9, 1.9)
+        _fill(p, ink, focus_dot)
+
+    elif name == "proofread":
+        # 文档 + 三行字 + 对勾：文本体检
+        p.drawRoundedRect(QRectF(5.5, 3.8, 13, 16.4), 2, 2)
+        _line(p, 8.5, 8, 15.5, 8)
+        _line(p, 8.5, 12, 13.5, 12)
+        _poly(p, [(8.6, 16.1), (11, 18.2), (15.6, 13.4)])
 
     else:
         # 未知名：画一个虚线安全框，绝不静默空白

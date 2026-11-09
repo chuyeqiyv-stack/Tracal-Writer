@@ -1141,7 +1141,9 @@ class TimelineCanvas(QWidget):
         self._selected_id = str(node.get("id"))
         self.selection_changed.emit()
         self.update()
-        self._build_context_menu(node).exec(event.globalPos())
+        menu = self._build_context_menu(node)
+        menu.exec(event.globalPos())
+        menu.deleteLater()
 
     def _build_context_menu(self, node: dict) -> QMenu:
         """节点右键菜单（拆出来便于冒烟/截图复用同一份 UI）。"""
@@ -1149,7 +1151,7 @@ class TimelineCanvas(QWidget):
         locked = self._is_locked(node)
         menu.addAction("解锁事件" if locked else "锁定事件", lambda: self._toggle_lock(node))
 
-        color_menu = menu.addMenu("换色")
+        color_menu = menu.addMenu("更换事件颜色")
         color_menu.setToolTipsVisible(True)
         current = self._event_qcolor(node).name()
         dark = self._is_dark()

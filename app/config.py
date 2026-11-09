@@ -13,7 +13,7 @@ from pathlib import Path
 
 APP_NAME = "催客写作"
 APP_NAME_EN = "Trecal"   # 英文品牌展示名
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.11"
 ORG_NAME = "MojiWriter"  # 数据目录沿用旧名，避免升级后找不到已有数据
 
 # 默认正文字体（Windows 下若缺失会自动回退）
@@ -125,12 +125,20 @@ def set_custom_data_dir(path: Path | str) -> None:
 
 DATA_DIR = _user_data_dir()
 
-# 每本书最多保留的历史快照数量（获得「坚持不懈」成就后 +2）
+# 每章最多保留的历史快照数量（获得「坚持不懈」成就后 +2）
 MAX_SNAPSHOTS = 5
 
 # 两次“自动保存”快照之间的最小间隔（秒）——自动保存很频繁，
-# 按此间隔去重；手动保存（Ctrl+S）与切章/关窗始终立即记录。
+# 按此间隔去重；手动保存（Ctrl+S）始终立即记录。
 AUTO_SNAPSHOT_GAP = 10 * 60
+
+# 距上一版快照的字数变化达到该值时也留一版（与时间间隔二选一触发，
+# 避免短时间大量增删却一版不留）；手动保存不受此限。
+AUTO_SNAPSHOT_CHAR_DELTA = 200
+
+# 单本书全部章节的历史快照总字节上限，超出后按最旧淘汰（与每章份数上限
+# 共同构成「份数 + 总字节」双上限）。
+HISTORY_MAX_BYTES = 40 * 1024 * 1024
 
 # 自动保存防抖时间（毫秒）
 AUTOSAVE_DELAY_MS = 1500

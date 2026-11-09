@@ -362,6 +362,10 @@ class ToolbarButton(QAbstractButton):
         self._theme = theme
         self.update()
 
+    def set_compact(self, compact: bool) -> None:
+        """窄窗口紧凑模式：只收窄按钮宽度，高度 / hover / 字号保持不变。"""
+        self.setFixedSize(48 if compact else 58, 52)
+
     def set_icon(self, icon) -> None:
         self._icon = icon
         self._icon_spec = None

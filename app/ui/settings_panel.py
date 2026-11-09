@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from app import config
 from app.models import Settings
+from app.services.sounds import MANUAL_SAVE_SOUNDS, play_manual_save_sound
 from app.ui.widgets import AvatarView, ColorButton, HLine, SegmentedControl, SettingRow, ToggleSwitch
 
 
@@ -328,6 +330,10 @@ class SettingsDrawer(QDialog):
         # 输入设置
         section = self._add_section("输入设置")
         self._add_switch(section, "auto_pair", "成对标点", "输入左引号、左括号时自动补全另一半。")
+        self._add_switch(
+            section, "inline_hints", "正文内联提示",
+            "当前章命中字显示红色波浪线；悬停或光标停留时显示建议字。关闭不影响体检列表。",
+        )
 
         # 字数设置
         section = self._add_section("字数设置")
@@ -338,6 +344,21 @@ class SettingsDrawer(QDialog):
         self._add_switch(section, "fast_scroll", "快速滚动滑块", "在正文右侧显示纵向快速滚动条。")
         self._add_switch(section, "float_jump", "置顶置底按钮", "在正文右下角浮动显示回到顶部 / 底部按钮。")
         self._add_switch(section, "open_at_end", "打开时定位至文章末尾", "打开章节后，光标自动停在文末。")
+        self._add_switch(
+            section, "achievement_sound", "成就提示音",
+            "成就实际解锁时播放一声柔和提示音；开关状态会随设置持久化。",
+        )
+        self.save_sound_combo = QComboBox(self)
+        for key, (label, _filename) in MANUAL_SAVE_SOUNDS.items():
+            self.save_sound_combo.addItem(label, key)
+        current = str(getattr(self.settings, "manual_save_sound", "wood"))
+        index = self.save_sound_combo.findData(current)
+        self.save_sound_combo.setCurrentIndex(max(0, index))
+        self.save_sound_combo.currentIndexChanged.connect(self._on_save_sound_changed)
+        section.addWidget(SettingRow(
+            "保存提示音", self.save_sound_combo,
+            "仅手动保存（Ctrl+S）时播放，自动保存静默；选择后立即试听。",
+        ))
 
         # 存储（默认保存路径）起切到右列；左列保留外观 / 资料 / 排版 / 输入 / 字数 / 操作
         self._active_column = self._right_column
@@ -501,6 +522,15 @@ class SettingsDrawer(QDialog):
     def _set_color(self, field: str, value: str) -> None:
         self._set_value(field, value.upper())
 
+    def _on_save_sound_changed(self, _index: int) -> None:
+        """保存提示音下拉：写回设置并立即试听一次（关闭项不发声）。"""
+        if self._syncing:
+            return
+        key = str(self.save_sound_combo.currentData() or "wood")
+        self._set_value("manual_save_sound", key)
+        if key != "off":
+            play_manual_save_sound(key)
+
     def _on_profile_edited(self) -> None:
         nickname = self.nickname_edit.text().strip() or "写作者"
         avatar = self.avatar_edit.text().strip()
@@ -564,6 +594,9 @@ class SettingsDrawer(QDialog):
                 segment.set_value(str(getattr(self.settings, field)))
             for field, color in self._colors.items():
                 color.set_value(str(getattr(self.settings, field) or ""))
+            sound_index = self.save_sound_combo.findData(str(self.settings.manual_save_sound))
+            if sound_index >= 0:
+                self.save_sound_combo.setCurrentIndex(sound_index)
             self.nickname_edit.setText(self.settings.nickname)
             self.avatar_edit.setText(self.settings.avatar_path)
             self.avatar_view.set_data(self.settings.avatar_path, self.settings.nickname)
@@ -757,10 +790,29 @@ class SettingsDrawer(QDialog):
         event.accept()
         self.closed.emit()
 
+    def _collapse_external(self) -> None:
+        """主窗口被最小化 / 隐藏（Win+D、切虚拟桌面）时主动收起设置窗。
+
+        QDialog 带父窗口时，平台把主窗最小化并不会给对话框派发 hideEvent，
+        `_is_open` 会残留 True、遮罩仍是「可见」状态：主窗被变暗且点击被吞。
+        这里由主窗口事件过滤器统一收起，且只发一次 closed。
+        """
+        if not self._is_open:
+            return
+        self._is_open = False
+        self._hide_overlay()
+        self.hide()
+        self.closed.emit()
+
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
-        if obj is self.parentWidget() and event.type() == QEvent.Resize:
-            if self._overlay is not None and self._overlay.isVisible():
-                self._overlay.setGeometry(obj.rect())
+        if obj is self.parentWidget():
+            if event.type() == QEvent.Resize:
+                if self._overlay is not None and self._overlay.isVisible():
+                    self._overlay.setGeometry(obj.rect())
+            elif event.type() == QEvent.Hide:
+                self._collapse_external()
+            elif event.type() == QEvent.WindowStateChange and obj.isMinimized():
+                self._collapse_external()
         return super().eventFilter(obj, event)
 
     # 兼容旧调用：主窗口尺寸变化不再联动，只保证窗口仍在屏幕内

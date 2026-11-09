@@ -136,7 +136,24 @@ QLineEdit#EditorTitleEdit {
 #EditorPaper {
     background: $editor;
     border: none;
-    border-radius: 12px;
+    /* v1.4.4：纸张下沿贴窗口底边（状态栏已并入纸张内），下两角不再留圆角空档 */
+    border-radius: 0px;
+    border-top-left-radius: ${radius_lg}px;
+    border-top-right-radius: ${radius_lg}px;
+}
+/* 顶部栏收起：纸张上沿贴窗口上沿，上方两角也收平，避免出现圆角空档 */
+#EditorPaper[topFlush="true"] {
+    border-top-left-radius: 0px;
+    border-top-right-radius: 0px;
+}
+/* 左右栏收起：对应侧贴窗口边缘，同侧上下两角一起收平 */
+#EditorPaper[leftFlush="true"] {
+    border-top-left-radius: 0px;
+    border-bottom-left-radius: 0px;
+}
+#EditorPaper[rightFlush="true"] {
+    border-top-right-radius: 0px;
+    border-bottom-right-radius: 0px;
 }
 QTextEdit#NovelEditor {
     background: transparent;
@@ -258,6 +275,9 @@ QLabel#MsgText {
     padding: 0;
 }
 #SideToggle:hover { background: $hover_accent; color: $accent; }
+/* 目录收起后细条浮在纸张上：静止时只留箭头，不形成整条底色 */
+#SideToggle[floating="true"] { background: transparent; }
+#SideToggle[floating="true"]:hover { background: $hover_accent; color: $accent; }
 
 /* ---------------- 输入控件：无边框浅灰底，聚焦时微弱主题色 ---------------- */
 QLineEdit, QSpinBox, QComboBox, QFontComboBox {

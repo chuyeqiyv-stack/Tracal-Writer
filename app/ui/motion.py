@@ -8,9 +8,19 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt
+import weakref
+
+try:
+    import shiboken6
+except ImportError:  # PySide6 正常都带 shiboken6；缺失时退化为只查弱引用
+    shiboken6 = None
+
+from PySide6.QtCore import (
+    QAbstractAnimation, QEasingCurve, QEvent, QObject, QPropertyAnimation, Qt, QTimer,
+)
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
@@ -22,6 +32,12 @@ EASE_OUT = QEasingCurve.OutCubic          # 统一 ease-out 曲线
 DUR_FAST = 150                            # 按下 / 勾选等即时反馈
 DUR_BASE = 200                            # hover 切换 / 淡入
 DUR_SLOW = 280                            # 浮层 / 空状态出现
+
+# 动效统一按 60fps 上限推进：Qt 动画框架本身固定 16ms 一帧（实测 16.1ms，
+# 与屏幕刷新率无关），QTimer 驱动的循环不得低于该间隔，否则超频。
+FPS_CAP = 60
+FRAME_MS = 1000.0 / FPS_CAP
+MIN_FRAME_INTERVAL_MS = 17
 
 # level: (模糊半径, y 偏移, alpha 0-255) —— 默认与既有观感一致，
 # 可由 set_elevation_tokens 按外观风格覆盖（玻璃风更扩散、纸感更收敛）。
@@ -175,3 +191,247 @@ def fade_out(widget: QWidget, duration: int = DUR_FAST, on_finished=None) -> QPr
     anim.start()
     widget._fade_anim = anim
     return anim
+
+
+# ----------------------------------------------------------------------
+# 动效闸门：不可见时停表，恢复后原地续播
+# ----------------------------------------------------------------------
+# 窗口最小化 / 切到其它程序 / Hide 时，动画定时器不再推进：
+# - QAbstractAnimation（淡入淡出、卡片 hover、抽屉、圆环…）统一 pause()，
+#   恢复时 resume()，currentTime 原样保留，不会跳帧也不会停在半路；
+# - QTimer 驱动的循环（保存圆环、码字时速条）stop() 并记住运行态，恢复再 start()。
+# 多个挂起原因（应用失焦 + 最小化 + 隐藏）按引用计数合并，任一解除才续播。
+
+
+def _alive(obj) -> bool:
+    """包装对象是否仍可用：弱引用未失效，且 C++ 侧尚未析构。
+
+    Qt 父对象销毁动画后，Python 包装可能还活着（弱引用不为 None），
+    此时调用 state()/pause() 会访问已释放的 C++ 对象，必须先剪掉。
+    """
+    if obj is None:
+        return False
+    return shiboken6 is None or shiboken6.isValid(obj)
+
+
+class _AnimationGate(QObject):
+    def __init__(self) -> None:
+        super().__init__()
+        self._anims: dict[int, weakref.ref] = {}
+        self._paused: set[int] = set()
+        self._timers: dict[int, weakref.ref] = {}
+        self._stopped: set[int] = set()
+        self._holds: set[str] = set()
+        self._app_hooked = False
+
+    def _ensure_app_hook(self) -> None:
+        if self._app_hooked:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.installEventFilter(self)
+        self._app_hooked = True
+
+    def register(self, anim: QAbstractAnimation) -> None:
+        if not _alive(anim):
+            return
+        self._ensure_app_hook()
+        key = id(anim)
+        self._anims[key] = weakref.ref(anim)
+        if not self._holds:
+            return
+        try:
+            if anim.state() == QAbstractAnimation.State.Running:
+                anim.pause()
+                self._paused.add(key)
+        except RuntimeError:
+            self._anims.pop(key, None)
+
+    def after_start(self, anim: QAbstractAnimation) -> None:
+        """start() 之后复查：挂起期间才启动的动画要立刻暂停在 0 帧。"""
+        if not _alive(anim):
+            return
+        key = id(anim)
+        self._anims[key] = weakref.ref(anim)
+        if not self._holds:
+            return
+        try:
+            if anim.state() == QAbstractAnimation.State.Running:
+                anim.pause()
+                self._paused.add(key)
+        except RuntimeError:
+            self._anims.pop(key, None)
+
+    def register_timer(self, timer: QTimer) -> None:
+        """登记动画循环定时器；帧间隔低于 60fps 上限时钳到 17ms。"""
+        if not _alive(timer):
+            return
+        self._ensure_app_hook()
+        try:
+            interval = int(timer.interval())
+            if 0 < interval < MIN_FRAME_INTERVAL_MS:
+                timer.setInterval(MIN_FRAME_INTERVAL_MS)
+        except (RuntimeError, TypeError):
+            return
+        self._timers[id(timer)] = weakref.ref(timer)
+
+    def hold(self, reason: str) -> None:
+        if reason in self._holds:
+            return
+        self._holds.add(reason)
+        if len(self._holds) == 1:
+            self._suspend()
+
+    def release(self, reason: str) -> None:
+        if reason not in self._holds:
+            return
+        self._holds.discard(reason)
+        if not self._holds:
+            self._resume()
+
+    def _prune(self) -> None:
+        for key, ref in list(self._anims.items()):
+            if not _alive(ref()):
+                self._anims.pop(key, None)
+                self._paused.discard(key)
+        for key, ref in list(self._timers.items()):
+            if not _alive(ref()):
+                self._timers.pop(key, None)
+                self._stopped.discard(key)
+
+    def _suspend(self) -> None:
+        self._prune()
+        dead: list[int] = []
+        for key, ref in list(self._anims.items()):
+            anim = ref()
+            if not _alive(anim):
+                dead.append(key)
+                continue
+            try:
+                if anim.state() == QAbstractAnimation.State.Running:
+                    anim.pause()
+                    self._paused.add(key)
+            except RuntimeError:
+                dead.append(key)
+        for key in dead:
+            self._anims.pop(key, None)
+            self._paused.discard(key)
+        dead.clear()
+        for key, ref in list(self._timers.items()):
+            timer = ref()
+            if not _alive(timer):
+                dead.append(key)
+                continue
+            try:
+                if timer.isActive():
+                    timer.stop()
+                    self._stopped.add(key)
+            except RuntimeError:
+                dead.append(key)
+        for key in dead:
+            self._timers.pop(key, None)
+            self._stopped.discard(key)
+
+    def _resume(self) -> None:
+        self._prune()
+        dead: list[int] = []
+        for key in list(self._paused):
+            ref = self._anims.get(key)
+            anim = ref() if ref is not None else None
+            if not _alive(anim):
+                dead.append(key)
+                continue
+            try:
+                if anim.state() == QAbstractAnimation.State.Paused:
+                    anim.resume()
+            except RuntimeError:
+                dead.append(key)
+        self._paused.clear()
+        for key in dead:
+            self._anims.pop(key, None)
+        dead.clear()
+        for key in list(self._stopped):
+            ref = self._timers.get(key)
+            timer = ref() if ref is not None else None
+            if not _alive(timer):
+                dead.append(key)
+                continue
+            try:
+                if not timer.isActive():
+                    timer.start()
+            except RuntimeError:
+                dead.append(key)
+        self._stopped.clear()
+        for key in dead:
+            self._timers.pop(key, None)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.ApplicationStateChange:
+            app = QApplication.instance()
+            if app is not None and app.applicationState() == Qt.ApplicationState.ApplicationActive:
+                self.release("app_inactive")
+            else:
+                self.hold("app_inactive")
+        return False
+
+
+_GATE: _AnimationGate | None = None
+_HOOKED = False
+
+
+def _gate() -> _AnimationGate:
+    global _GATE
+    if _GATE is None:
+        _GATE = _AnimationGate()
+    return _GATE
+
+
+def _install_animation_hook() -> None:
+    """接管所有 QAbstractAnimation.start：登记实例，供不可见时统一暂停。
+
+    只包一层 Python 侧的 start（PySide 子类均继承该方法），不动 C++ 行为，
+    异常一律不向调用方抛出，避免动效故障影响交互。
+    """
+    global _HOOKED
+    if _HOOKED:
+        return
+    _HOOKED = True
+    original_start = QAbstractAnimation.start
+
+    def _start(self, *args, **kwargs):
+        gate = _gate()
+        try:
+            gate.register(self)
+        except (RuntimeError, TypeError):
+            pass
+        result = original_start(self, *args, **kwargs)
+        try:
+            gate.after_start(self)
+        except (RuntimeError, TypeError):
+            pass
+        return result
+
+    QAbstractAnimation.start = _start
+
+
+def register_timer(timer: QTimer) -> None:
+    """登记 QTimer 驱动的动画循环（保存圆环、时速条等）。"""
+    _gate().register_timer(timer)
+
+
+def hold_animations(reason: str) -> None:
+    """挂起动效（窗口不可见 / 应用失焦）。"""
+    _gate().hold(reason)
+
+
+def release_animations(reason: str) -> None:
+    """解除挂起，从当前帧继续。"""
+    _gate().release(reason)
+
+
+def animations_suspended() -> bool:
+    return bool(_GATE is not None and _GATE._holds)
+
+
+_install_animation_hook()

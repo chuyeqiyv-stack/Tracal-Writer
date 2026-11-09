@@ -87,6 +87,7 @@ class Settings:
     # 输入
     auto_pair: bool = True              # 成对标点自动补全
     tab_cjk_indent: bool = False        # Tab 插入两个全角空格（中文缩进，默认关）
+    inline_hints: bool = True           # 正文内联提示：当前章红波浪线 + 悬停建议字
 
     # 字数
     exclude_punct: bool = False         # 字数统计不计标点
@@ -99,28 +100,36 @@ class Settings:
     fast_scroll: bool = True
     float_jump: bool = True
     open_at_end: bool = True
+    achievement_sound: bool = True       # 成就解锁提示音（Windows winsound，默认开）
+    manual_save_sound: str = "wood"       # 手动保存提示音：off / wood / bell / paper / dingdong / lowhum（默认木质轻叩）
 
     # 字体
     font_family: str = DEFAULT_FONT_FAMILY   # 中文字体（空 = 默认字体）
     font_latin: str = "Segoe UI"             # 英文字体
-    font_size: float = 16.0
+    # v1.4.4：默认正文对齐参考「口袋写作」——12pt（96dpi 下 16px）、行距 1.55em
+    font_size: float = 12.0
     font_bold: bool = False                  # 加粗
     font_italic: bool = False                # 斜体
     font_underline: bool = False             # 下划线
-    line_spacing: float = 1.8
+    line_spacing: float = 1.55
     # 段落排版（“排版”按钮 / 正文右键“段落设置”，借鉴 Word 段落对话框）
     para_align: str = "left"            # left / center / right
     para_indent: int = 0                # 首行缩进字符数（0-8；智能排版已插全角空格时保持 0）
-    para_space_before: float = 0.0      # 段前间距（行）
-    para_space_after: float = 0.0       # 段后间距（行）
+    para_space_before: float = 0.5      # 段前间距（行）
+    para_space_after: float = 0.5       # 段后间距（行）
     imported_fonts: list[str] = field(default_factory=list)
 
     # 书架
     shelf_view: str = "grid"            # grid / list
+    notes_view: str = "grid"            # 设定页：grid 卡片 / list 列表
     character_view: str = "list"        # 角色页：list 角色列表 / board 关系图
     snippets_width: int = 320           # 右侧「文笔仿写」片段栏宽度（px，收起时保留）
     snippets_open: bool = False         # 仿写区展开状态（面板右上角箭头 / Esc 收起后记住）
+    # v1.4.9：整卷导出上次使用的目录（空 = 系统文档目录）
+    export_dir: str = ""
     ui_style: str = "default"           # 外观风格：default/paper/glass/order（与深浅正交）
+    # v1.4.4：写作页顶部工具栏收起状态（重开程序保持；书架页不受影响）
+    topbar_collapsed: bool = False
     # 玻璃质感三档（ui_style=glass 时生效）：block 立体玻璃块（默认）/ liquid 液态玻璃 / frosted 磨砂雾面
     glass_mode: str = "block"
     glass_blur: bool = True             # 玻璃风：背后内容高斯模糊（关闭后仅半透明本体，低端机可用）
@@ -196,6 +205,8 @@ class Settings:
                 result.writing_theme = "auto"
         if result.shelf_view not in {"grid", "list"}:
             result.shelf_view = "grid"
+        if result.notes_view not in {"grid", "list"}:
+            result.notes_view = "grid"
         if result.character_view not in {"list", "board"}:
             result.character_view = "list"
         if result.ui_style not in {"default", "paper", "glass", "order"}:

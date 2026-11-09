@@ -1898,6 +1898,7 @@ class RelationCanvas(QWidget):
                 )
                 menu.addAction("删除关系", lambda: self._delete_edge(edge))
                 menu.exec(event.globalPos())
+                menu.deleteLater()
                 return
             menu = self._make_menu()
             menu.addAction(
@@ -2827,6 +2828,7 @@ class CharactersPanel(QWidget):
             menu.addAction("编辑角色", lambda: self.edit_character(self._selected_id))
             menu.addAction("删除角色", lambda: self.delete_character(self._selected_id))
         menu.exec(self.table.viewport().mapToGlobal(pos))
+        menu.deleteLater()
 
     # ------------------------------------------------------------------
     # 详情卡

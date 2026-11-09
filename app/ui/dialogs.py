@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 
 from app import config
 from app.services import backgrounds, font_store, name_data
+from app.services.proofread import scan_text
 from app.services.search import find_all, line_number_at, line_snippet
 from app.services.word_count import format_word_count
 from app.storage import Storage
@@ -400,8 +401,8 @@ class NewBookDialog(QDialog):
 
 # 字号下拉选项：8.0 ~ 32.0，步进 0.5
 FONT_SIZE_OPTIONS = [f"{8 + i * 0.5:.1f}" for i in range(49)]
-# 默认字号（下拉里该项显示「默认」）
-FONT_SIZE_DEFAULT = 16.0
+# 默认字号（下拉里该项显示「默认」）：v1.4.4 对齐参考软件，12pt = 96dpi 下 16px
+FONT_SIZE_DEFAULT = 12.0
 
 # 文字颜色预设（字体面板颜色块按钮的弹出菜单）
 PRESET_TEXT_COLORS = [
@@ -1141,10 +1142,221 @@ class GlobalSearchDialog(QDialog):
         self.search_edit.selectAll()
 
 
+class ProofreadDialog(QDialog):
+    """文本体检：只报告高置信度的「的 / 地 / 得」等问题，确认后才替换。"""
+
+    DISPLAY_LIMIT = 400
+    RULE_SHORT = {
+        "adj_de_noun": "的/地/得",
+        "adv_de_verb": "的/地/得",
+        "verb_de_degree": "的/地/得",
+        "repeat_particle": "重复字",
+        "unpaired": "配对",
+        "width": "全半角",
+    }
+
+    def __init__(self, window, parent=None) -> None:
+        super().__init__(parent)
+        self.window = window
+        self._issues: list[dict] = []
+        self._scan_text: dict[str, str] = {}
+        self.setWindowTitle("文本体检")
+        self.setModal(False)
+        self.resize(700, 520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 16)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self.scope_combo = QComboBox(self)
+        self.scope_combo.addItems(["当前章", "全书"])
+        top.addWidget(self.scope_combo)
+        scan_button = _primary("重新体检", self)
+        scan_button.clicked.connect(self.rescan)
+        top.addWidget(scan_button)
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        hint = QLabel(
+            "只提示、不自动改。点击列表条目会跳到原文并选中；确认后可用「替换本条」"
+            "或「替换本章全部」，两种替换都可用 Ctrl+Z 撤销。", self
+        )
+        hint.setObjectName("DrawerHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.count_label = QLabel("", self)
+        self.count_label.setObjectName("DrawerHint")
+        layout.addWidget(self.count_label)
+
+        self.results = QListWidget(self)
+        self.results.setFrameShape(QFrame.NoFrame)
+        self.results.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.results.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        from app.ui.scroll_float import ScrollFlasher
+
+        self._results_flasher = ScrollFlasher(self.results, Qt.Vertical, inset=6)
+        layout.addWidget(self.results, 1)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        self.replace_one = _ghost("替换本条", self)
+        self.replace_one.setEnabled(False)
+        self.replace_one.clicked.connect(self.replace_one_issue)
+        self.replace_chapter = _primary("替换本章全部", self)
+        self.replace_chapter.clicked.connect(self.replace_current_chapter)
+        close_button = _ghost("关闭", self)
+        close_button.clicked.connect(self.close)
+        bottom.addWidget(self.replace_one)
+        bottom.addWidget(self.replace_chapter)
+        bottom.addWidget(close_button)
+        layout.addLayout(bottom)
+
+        self.results.itemClicked.connect(self._jump_to_issue)
+        self.results.currentRowChanged.connect(self._on_row_changed)
+
+    # ------------------------------------------------------------------
+    def rescan(self) -> None:
+        self.window.flush()
+        book = self.window.book
+        self.results.clear()
+        self._issues = []
+        self._scan_text = {}
+        if book is None or not self.window.current_chapter_id:
+            self.count_label.setText("请先打开一本书并进入正文章节。")
+            return
+
+        scope_all = self.scope_combo.currentIndex() == 1
+        current_id = self.window.current_chapter_id
+        current_text = self.window.editor_page.current_text()
+        chapters = [
+            ch for ch in book.all_chapters()
+            if scope_all or ch.id == current_id
+        ]
+        for chapter in chapters:
+            text = current_text if chapter.id == current_id else chapter.content
+            self._scan_text[chapter.id] = text
+            for issue in scan_text(text):
+                row = dict(issue)
+                row["chapter_id"] = chapter.id
+                row["chapter_title"] = chapter.title
+                self._issues.append(row)
+
+        shown = self._issues[: self.DISPLAY_LIMIT]
+        for issue in shown:
+            prefix = "" if issue["chapter_id"] == current_id else f"{issue['chapter_title']} · "
+            suffix = "" if issue["fixable"] else "（需手工处理）"
+            item = QListWidgetItem(
+                f"{prefix}第 {issue['line']} 行 · {issue['title']}{suffix}\n"
+                f"…{issue['snippet']}…"
+            )
+            item.setData(Qt.UserRole, issue)
+            self.results.addItem(item)
+
+        if self._issues:
+            counts: dict[str, int] = {}
+            for issue in self._issues:
+                counts[issue["rule"]] = counts.get(issue["rule"], 0) + 1
+            detail = "、".join(
+                f"{self.RULE_SHORT.get(key, key)} {value}" for key, value in counts.items()
+            )
+            text = f"共 {len(self._issues)} 处：{detail}"
+            if len(self._issues) > len(shown):
+                text += f"（仅列出前 {self.DISPLAY_LIMIT} 条）"
+            self.count_label.setText(text)
+            self.results.setCurrentRow(0)
+        else:
+            self.count_label.setText("没有发现高置信度的问题（宁可漏报，不误报）。")
+
+    # ------------------------------------------------------------------
+    def _jump_to_issue(self, item: QListWidgetItem) -> None:
+        issue = item.data(Qt.UserRole)
+        if not issue:
+            return
+        self.window.jump_to_match(issue["chapter_id"], issue["start"], issue["length"])
+
+    def _on_row_changed(self, row: int) -> None:
+        item = self.results.item(row)
+        issue = item.data(Qt.UserRole) if item is not None else None
+        self.replace_one.setEnabled(bool(issue and issue.get("fixable")))
+
+    # ------------------------------------------------------------------
+    def _content_changed(self, chapter_id: str) -> bool:
+        """扫描后正文被改过则旧位置失效，要求重新体检。"""
+        if chapter_id == self.window.current_chapter_id:
+            return self._scan_text.get(chapter_id) != self.window.editor_page.current_text()
+        _volume, chapter = self.window.book.find_chapter(chapter_id)
+        return chapter is None or self._scan_text.get(chapter_id) != chapter.content
+
+    def _ask(self, title: str, text: str) -> bool:
+        return bool(self.window._confirm(title, text))
+
+    def _after_replace(self, count: int) -> None:
+        self.rescan()
+        self.count_label.setText(f"已替换 {count} 处，可用 Ctrl+Z 撤销。{self.count_label.text()}")
+
+    def replace_one_issue(self) -> None:
+        item = self.results.currentItem()
+        issue = item.data(Qt.UserRole) if item is not None else None
+        if not issue or not issue.get("fixable"):
+            return
+        if self._content_changed(issue["chapter_id"]):
+            MessageBox.information(self, "文本体检", "正文已变化，已重新体检，请再确认一次。")
+            self.rescan()
+            return
+        self.window.jump_to_match(issue["chapter_id"], issue["start"], issue["length"])
+        page = self.window.editor_page
+        text = page.current_text()
+        if text[issue["start"]:issue["start"] + issue["length"]] != issue["original"]:
+            MessageBox.information(self, "文本体检", "正文已变化，已重新体检，请再确认一次。")
+            self.rescan()
+            return
+        page.apply_replacements(
+            [(issue["start"], issue["length"], issue["replacement"])]
+        )
+        self._after_replace(1)
+
+    def replace_current_chapter(self) -> None:
+        chapter_id = self.window.current_chapter_id
+        if not chapter_id:
+            return
+        if self._content_changed(chapter_id):
+            MessageBox.information(self, "文本体检", "正文已变化，已重新体检，请再确认一次。")
+            self.rescan()
+            return
+        rows = [
+            issue for issue in self._issues
+            if issue["chapter_id"] == chapter_id and issue.get("fixable")
+        ]
+        if not rows:
+            MessageBox.information(self, "文本体检", "当前章没有可一键替换的问题。")
+            return
+        if not self._ask(
+            f"替换本章 {len(rows)} 处？",
+            "将把本章体检出的「的/地/得」等问题一并替换；替换后可用 Ctrl+Z 撤销。",
+        ):
+            return
+        page = self.window.editor_page
+        page.apply_replacements(
+            [(issue["start"], issue["length"], issue["replacement"]) for issue in rows]
+        )
+        self._after_replace(len(rows))
+
+
 class HistoryDialog(QDialog):
     """历史版本列表与预览。"""
 
-    def __init__(self, storage: Storage, book_id: str, chapter_id: str, title: str, parent=None) -> None:
+    def __init__(
+        self,
+        storage: Storage,
+        book_id: str,
+        chapter_id: str,
+        title: str,
+        cap: int = config.MAX_SNAPSHOTS,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.storage = storage
         self.book_id = book_id
@@ -1152,15 +1364,16 @@ class HistoryDialog(QDialog):
         self.snapshots = storage.list_snapshots(book_id, chapter_id)
         self.setWindowTitle(f"历史版本 · {title}")
         self.setModal(True)
-        self.resize(640, 500)
+        self.resize(680, 520)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 16)
         layout.setSpacing(10)
 
         hint = QLabel(
-            "写作时每次自动保存都会记录一个历史版本，每本书最多保留 "
-            f"{config.MAX_SNAPSHOTS} 个（获得「坚持不懈」成就后 +2）。选择后可恢复到对应版本。",
+            "写作时每次自动保存都会按间隔/字数变化记录一版，每章最多保留 "
+            f"{max(1, int(cap))} 个。选择后可恢复到对应版本；恢复前会自动把"
+            "当前内容也存一版，随时可以再恢复回来。",
             self,
         )
         hint.setObjectName("DrawerHint")
@@ -1176,8 +1389,10 @@ class HistoryDialog(QDialog):
         self._list_flasher = ScrollFlasher(self.list, Qt.Vertical, inset=6)
         for snapshot in self.snapshots:
             chars = int(snapshot.get("chars") or 0)
+            content = self.storage.snapshot_content(snapshot)
             item = QListWidgetItem(
-                f"{self.storage.snapshot_time_text(snapshot)}   ·   {format_word_count(chars)} 字"
+                f"{self.storage.snapshot_time_text(snapshot)}   ·   "
+                f"{format_word_count(chars)} 字\n{self._head_lines(content)}"
             )
             item.setData(Qt.UserRole, snapshot)
             self.list.addItem(item)
@@ -1186,7 +1401,7 @@ class HistoryDialog(QDialog):
         self.preview = QPlainTextEdit(self)
         self.preview.setObjectName("Preview")
         self.preview.setReadOnly(True)
-        self.preview.setPlaceholderText("选择左侧版本后，这里会显示当时的正文。")
+        self.preview.setPlaceholderText("选择左侧版本后，这里会显示当时的正文（只读）。")
         from app.ui.scroll_float import attach_flasher
 
         attach_flasher(self.preview, Qt.Vertical, inset=6)
@@ -1210,12 +1425,20 @@ class HistoryDialog(QDialog):
         else:
             hint.setText("当前章节还没有历史快照，继续写作后会自动生成。")
 
+    @staticmethod
+    def _head_lines(content: str, width: int = 44) -> str:
+        """列表摘要：取正文前两个非空行，过长时截断。"""
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if not lines:
+            return "（空白版本）"
+        head = " / ".join(lines[:2])
+        return head if len(head) <= width else head[:width] + "…"
+
     def _show_preview(self, row: int) -> None:
         if row < 0 or row >= len(self.snapshots):
             self.preview.setPlainText("")
             return
-        content = self.storage.snapshot_content(self.snapshots[row])
-        self.preview.setPlainText(content[:4000])
+        self.preview.setPlainText(self.storage.snapshot_content(self.snapshots[row]))
 
     def selected_content(self) -> str | None:
         row = self.list.currentRow()

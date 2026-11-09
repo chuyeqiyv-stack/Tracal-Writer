@@ -2,6 +2,8 @@
 """正文编辑区：章节标题、编辑器、状态栏、悬浮快捷控件。"""
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import (
     QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer,
     QVariantAnimation, Signal,
@@ -9,6 +11,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontMetricsF,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -22,6 +25,7 @@ from PySide6.QtGui import (
     QTextDocument,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -36,8 +40,10 @@ from PySide6.QtWidgets import (
 
 from app.models import DEFAULT_FONT_FAMILY, Settings
 from app.services import backgrounds
+from app.services.proofread import scan_text
 from app.services.search import find_all
 from app.services.word_count import count_chars
+from app.ui import motion
 from app.ui.icons import IconFactory
 from app.ui.widgets import apply_shadow
 
@@ -120,8 +126,13 @@ class NovelEditor(QTextEdit):
         self._undoing = False        # 正在执行“只撤文字”的撤销循环
         # 撤销后由 EditorPage 挂上的“把排版补回来”的钩子（见 _undo_text_only）
         self.after_undo = None
+        # 撤销 / 重做结束后由 EditorPage 挂上的状态同步钩子（字数 + 自动保存）
+        self.after_history = None
         # 点击 / 聚焦前由 EditorPage 挂上的自愈钩子（见 _run_press_hook）
         self.before_mouse_press = None
+        # 即将插入文字前由 EditorPage 挂上的钩子：先把空块换成正文段距，
+        # 让“格式”命令排在输入之前，连续输入的 10 个字仍合并为一步撤销
+        self.before_type = None
         self._in_press_hook = False
         self.setAcceptRichText(False)
         self.setLineWrapMode(QTextEdit.WidgetWidth)
@@ -130,6 +141,32 @@ class NovelEditor(QTextEdit):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setCursorWidth(1)
+        # 正文内联提示：当前章问题标注 + 悬停 / 光标处建议字（不改文档内容）
+        self._inline_enabled = True
+        self._inline_issues: list[dict] = []          # 整章问题列表（内存中保留）
+        self._inline_selections: list[QTextEdit.ExtraSelection] = []  # 仅可见附近
+        self._inline_built_span: tuple[int, int] | None = None
+        self._inline_fmt: QTextCharFormat | None = None
+        self._search_selections: list[QTextEdit.ExtraSelection] = []
+        self._ghost_pos = -1
+        self._ghost_end = -1
+        self._ghost_text = ""
+        self._ghost_rect: QRect | None = None
+        self._ghost_pending: tuple[int, int, str] | None = None
+        self._ghost_timer = QTimer(self)
+        self._ghost_timer.setSingleShot(True)
+        self._ghost_timer.setInterval(50)
+        self._ghost_timer.timeout.connect(self._commit_ghost)
+        # 滚动 / 尺寸变化后合并重建可见标注：16ms 单次定时器，一帧最多一次
+        self._inline_rebuild_timer = QTimer(self)
+        self._inline_rebuild_timer.setSingleShot(True)
+        self._inline_rebuild_timer.setInterval(16)
+        self._inline_rebuild_timer.timeout.connect(self._rebuild_inline_marks)
+        self.viewport().setMouseTracking(True)
+        self.viewport().installEventFilter(self)
+        self.cursorPositionChanged.connect(self._queue_ghost_from_cursor)
+        self.verticalScrollBar().valueChanged.connect(self._hide_ghost)
+        self.verticalScrollBar().valueChanged.connect(self._schedule_inline_rebuild)
         self.adapt_caret()           # 光标粗细跟随初始字号（高度由行高自动决定）
         self.setTabChangesFocus(False)
         self.setPlaceholderText("从这里开始你的故事……")
@@ -150,6 +187,18 @@ class NovelEditor(QTextEdit):
         finally:
             self._in_press_hook = False
 
+    def _run_type_hook(self) -> None:
+        """文字即将插入前跑一次 EditorPage 的“空块转正文段距”钩子。"""
+        hook = getattr(self, "before_type", None)
+        if callable(hook):
+            hook()
+
+    def inputMethodEvent(self, event) -> None:  # noqa: N802
+        # 中文输入法提交换行 / 上屏前也要先换段距，否则格式命令会落在
+        # 插入之后，把一次上屏拆成两个撤销步
+        self._run_type_hook()
+        super().inputMethodEvent(event)
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         self._run_press_hook()
         super().mousePressEvent(event)
@@ -159,7 +208,8 @@ class NovelEditor(QTextEdit):
         super().focusInEvent(event)
 
     def adapt_caret(self) -> None:
-        """插入符随当前字体自适应：宽度 1–2px（小字 1px、大字 2px）。
+        """插入符随当前字体自适应：宽度按设备像素比分流（≥1.25 缩放恒 1 逻辑像素；
+        100% 屏沿用原 1–2px：小字 1px、大字 2px）。
 
         高度沿用 QTextEdit 原生插入符——它按当前文本块的行布局（含字体度量与
         行距设置）绘制，字号 / 字体 / 行距变化后自动变高变矮，无需手画。
@@ -168,7 +218,10 @@ class NovelEditor(QTextEdit):
         size = float(self.font().pointSizeF() or 0.0)
         if size <= 0.0:                  # 像素字号等兜底：直接看行高
             size = self.fontMetrics().height() / 1.35
-        width = 2 if size >= 16.0 else 1
+        if self.devicePixelRatioF() >= 1.25:
+            width = 1                    # 125% 及以上缩放：大字也用 1 个逻辑像素
+        else:
+            width = 2 if size >= 16.0 else 1   # 100% 屏：恢复原 2px 档
         if self.cursorWidth() != width:
             self.setCursorWidth(width)
 
@@ -181,6 +234,8 @@ class NovelEditor(QTextEdit):
         文档默认字体（改字号才能即时生效）。
         """
         self._paste_insert = True
+        # 粘贴到空块时同样先把段距换回正文段距（格式命令在插入之前）
+        self._run_type_hook()
         cursor = self.textCursor()
         start = cursor.position()
         block_format = QTextBlockFormat(cursor.blockFormat())
@@ -230,6 +285,8 @@ class NovelEditor(QTextEdit):
                 self.after_undo()
         finally:
             self._undoing = False
+        if callable(self.after_history):
+            self.after_history(before)
 
     def redo(self) -> None:
         """重做时同样跳过“排版格式”步骤，只重做文字。"""
@@ -244,6 +301,8 @@ class NovelEditor(QTextEdit):
                 guard += 1
         finally:
             self._undoing = False
+        if callable(self.after_history):
+            self.after_history(before)
 
     def _insert_formatted_block(self) -> None:
         """回车：新段落沿用当前段落的行高 / 缩进 / 段距。
@@ -271,6 +330,11 @@ class NovelEditor(QTextEdit):
     def keyPressEvent(self, event) -> None:  # noqa: N802
         # 注意：Qt6 的修饰键是枚举对象，不能直接和整数 0 比较
         blocked = event.modifiers() & (Qt.ControlModifier | Qt.AltModifier)
+        # 可打印字符即将落笔：先把空块的段距换回正文段距（格式命令在输入之前，
+        # 才不会把连续输入拆成多个撤销步）
+        text = event.text()
+        if text and len(text) == 1 and blocked == Qt.NoModifier and text.isprintable():
+            self._run_type_hook()
         if self.auto_pair and blocked == Qt.NoModifier:
             text = event.text()
             if len(text) == 1:
@@ -351,6 +415,282 @@ class NovelEditor(QTextEdit):
             return
 
         super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------
+    # 专注模式：光标行滚动居中
+    # ------------------------------------------------------------------
+    def center_cursor(self) -> None:
+        """把当前光标行滚到视口中线（QTextEdit 没有 centerCursor）。"""
+        bar = self.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        rect = self.cursorRect()
+        target = bar.value() + rect.center().y() - self.viewport().height() // 2
+        bar.setValue(max(0, min(bar.maximum(), target)))
+
+    # ------------------------------------------------------------------
+    # 正文内联提示：红色波浪线 + 当前字右侧的建议字
+    # ------------------------------------------------------------------
+    def set_inline_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._inline_enabled == enabled:
+            return
+        self._inline_enabled = enabled
+        if not enabled:
+            self.clear_inline_marks()
+
+    def clear_inline_marks(self) -> None:
+        """清空当前章标注与建议字（编辑、切章、关闭开关时调用）。"""
+        had_marks = bool(self._inline_selections or self._ghost_rect)
+        self._inline_issues = []
+        self._inline_selections = []
+        self._inline_built_span = None
+        self._sync_extra_selections()
+        self._hide_ghost()
+        if had_marks:
+            self.viewport().update()
+
+    def set_inline_issues(self, issues: list[dict]) -> None:
+        """整章问题列表放内存；ExtraSelection 只为可见区域附近构建一次。"""
+        self._inline_issues = [dict(item) for item in (issues or [])]
+        self._inline_built_span = None
+        self._rebuild_inline_marks()
+        self._hide_ghost()
+
+    def _inline_mark_format(self) -> QTextCharFormat:
+        if self._inline_fmt is None:
+            fmt = QTextCharFormat()
+            fmt.setUnderlineStyle(QTextCharFormat.UnderlineStyle.WaveUnderline)
+            fmt.setUnderlineColor(QColor(206, 54, 54))
+            self._inline_fmt = fmt
+        return self._inline_fmt
+
+    def _visible_position_span(self) -> tuple[int, int]:
+        """视口首尾字符位置，上下各扩一屏；长段落 / 多段落都适用。"""
+        viewport = self.viewport()
+        document = self.document()
+        max_pos = max(0, document.characterCount() - 1)
+        top = self.cursorForPosition(QPoint(0, 0)).position()
+        bottom = self.cursorForPosition(QPoint(0, max(0, viewport.height() - 1))).position()
+        if bottom < top:
+            top, bottom = bottom, top
+        if max_pos <= 0:
+            return 0, 0
+        span = max(200, bottom - top)
+        return max(0, top - span), min(max_pos, bottom + span)
+
+    def _schedule_inline_rebuild(self, *_args) -> None:
+        """滚动 / 尺寸变化时合并重建：一帧最多一次，不随滚动像素逐次重建。"""
+        if not self._inline_issues:
+            return
+        if not self._inline_rebuild_timer.isActive():
+            self._inline_rebuild_timer.start()
+
+    def _rebuild_inline_marks(self) -> None:
+        """按当前视口重建可见附近的 ExtraSelection。
+
+        只替换 extraSelections 并刷新 viewport：不改文本 / 格式 / 行高 /
+        滚动位置，也不清掉正在显示的建议字。
+        """
+        if not self._inline_enabled or not self._inline_issues:
+            if self._inline_selections:
+                self._inline_selections = []
+                self._inline_built_span = None
+                self._sync_extra_selections()
+                self.viewport().update()
+            return
+        span = self._visible_position_span()
+        if span == self._inline_built_span:
+            return
+        document = self.document()
+        max_pos = max(0, document.characterCount() - 1)
+        start, end = span
+        fmt = self._inline_mark_format()
+        selections: list[QTextEdit.ExtraSelection] = []
+        for issue in self._inline_issues:
+            pos = int(issue.get("start", -1))
+            length = max(1, int(issue.get("length", 1)))
+            if pos < 0 or pos >= max_pos:
+                continue
+            if pos + length <= start or pos >= end:
+                continue
+            cursor = QTextCursor(document)
+            cursor.setPosition(pos)
+            cursor.setPosition(min(max_pos, pos + length), QTextCursor.KeepAnchor)
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = cursor
+            selection.format = fmt
+            selections.append(selection)
+        self._inline_built_span = span
+        self._inline_selections = selections
+        self._sync_extra_selections()
+        self.viewport().update()
+
+    def set_search_selections(self, selections) -> None:
+        """查找高亮走这里，与内联标注合并，避免互相清空。"""
+        self._search_selections = list(selections or [])
+        self._sync_extra_selections()
+
+    def _sync_extra_selections(self) -> None:
+        selections = self._search_selections + self._inline_selections
+        self.setExtraSelections(selections if selections else [])
+
+    def _issue_at(self, position: int) -> dict | None:
+        for issue in self._inline_issues:
+            start = int(issue.get("start", -1))
+            length = max(1, int(issue.get("length", 1)))
+            if start <= position < start + length:
+                return issue
+        return None
+
+    @staticmethod
+    def _ghost_text_for(issue: dict | None) -> str:
+        if not issue or not bool(issue.get("fixable", True)):
+            return ""
+        replacement = str(issue.get("replacement") or "")
+        return replacement[:1]
+
+    def _queue_ghost_from_cursor(self) -> None:
+        self._queue_ghost(self.textCursor().position())
+
+    def _queue_ghost(self, position: int) -> None:
+        if not self._inline_enabled:
+            self._hide_ghost()
+            return
+        issue = self._issue_at(position)
+        text = self._ghost_text_for(issue)
+        if not text:
+            self._hide_ghost()
+            return
+        start = int(issue.get("start", -1))
+        end = start + max(1, int(issue.get("length", 1)))
+        if (start, end, text) == (self._ghost_pos, self._ghost_end, self._ghost_text):
+            return
+        if (start, end, text) == self._ghost_pending:
+            return
+        self._ghost_pending = (start, end, text)
+        self._ghost_timer.start()
+
+    def _commit_ghost(self) -> None:
+        """防抖 50ms 后落定建议字；只有位置 / 文字变化时才局部重绘。"""
+        pending = self._ghost_pending
+        self._ghost_pending = None
+        if not pending or not self._inline_enabled:
+            return
+        start, end, text = pending
+        rect = self._ghost_rect_for(start, end, text)
+        if rect is None:
+            self._hide_ghost()
+            return
+        old = self._ghost_rect
+        self._ghost_pos = start
+        self._ghost_end = end
+        self._ghost_text = text
+        self._ghost_rect = rect
+        if old is not None:
+            self.viewport().update(old.united(rect))
+        else:
+            self.viewport().update(rect)
+
+    def _hide_ghost(self, *_args) -> None:
+        self._ghost_timer.stop()
+        self._ghost_pending = None
+        old = self._ghost_rect
+        self._ghost_pos = -1
+        self._ghost_end = -1
+        self._ghost_text = ""
+        self._ghost_rect = None
+        if old is not None:
+            self.viewport().update(old)
+
+    def _ghost_rect_for(self, start: int, end: int, text: str) -> QRect | None:
+        """建议字矩形；行尾放不下或已换行时返回 None（不挪位置、不换行）。"""
+        document = self.document()
+        max_pos = max(0, document.characterCount() - 1)
+        if start < 0 or start >= max_pos:
+            return None
+        end = max(start + 1, min(end, max_pos))
+        font = QFont(self.font())
+        font.setPixelSize(11)
+        arrow_font = QFont(font)
+        arrow_font.setPixelSize(8)
+        fm = QFontMetricsF(font, self)
+        afm = QFontMetricsF(arrow_font, self)
+        gap = 2
+        width = afm.horizontalAdvance("→") + gap + fm.horizontalAdvance(text) + 2
+        begin_cursor = QTextCursor(document)
+        begin_cursor.setPosition(start)
+        line = self.cursorRect(begin_cursor)
+        end_cursor = QTextCursor(document)
+        end_cursor.setPosition(end)
+        end_rect = self.cursorRect(end_cursor)
+        if end_rect.y() != line.y():          # 该字正好位于软换行处
+            return None
+        margin = int(document.documentMargin())
+        limit = self.viewport().width() - margin - 2
+        if end_rect.x() + width > limit:      # 行尾剩余宽度不够
+            return None
+        rect = QRect(int(end_rect.x() + gap), line.top(), int(width), max(1, line.height()))
+        if not self.viewport().rect().intersects(rect):
+            return None
+        return rect
+
+    def _paint_ghost(self, painter: QPainter) -> None:
+        if not self._inline_enabled or not self._ghost_text or self._ghost_rect is None:
+            return
+        rect = self._ghost_rect
+        base = self.palette().color(QPalette.Text)
+        ink = QColor(base)
+        ink.setAlpha(75)
+        arrow_ink = QColor(base)
+        arrow_ink.setAlpha(48)
+        font = QFont(self.font())
+        font.setPixelSize(11)
+        arrow_font = QFont(font)
+        arrow_font.setPixelSize(8)
+        fm = QFontMetricsF(font, self)
+        afm = QFontMetricsF(arrow_font, self)
+        baseline = rect.top() + (rect.height() + fm.ascent() - fm.descent()) / 2
+        arrow_x = rect.x()
+        painter.setFont(arrow_font)
+        painter.setPen(arrow_ink)
+        painter.drawText(QPointF(arrow_x, baseline), "→")
+        painter.setFont(font)
+        painter.setPen(ink)
+        painter.drawText(
+            QPointF(arrow_x + afm.horizontalAdvance("→") + 2, baseline),
+            self._ghost_text,
+        )
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.viewport():
+            if event.type() == QEvent.Leave:
+                self._hide_ghost()
+            elif event.type() == QEvent.MouseMove:
+                try:
+                    position = event.position().toPoint()
+                except AttributeError:
+                    position = event.pos()
+                self._queue_ghost(self.cursorForPosition(position).position())
+        return super().eventFilter(obj, event)
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        self._hide_ghost()
+        super().focusOutEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._hide_ghost()
+        super().resizeEvent(event)
+        # 视口尺寸变化后可见范围变了：合并到下一帧重建标注
+        self._schedule_inline_rebuild()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if not (self._inline_enabled and self._ghost_text and self._ghost_rect):
+            return
+        painter = QPainter(self.viewport())
+        self._paint_ghost(painter)
+        painter.end()
 
 
 class GlassUnitButton(QToolButton):
@@ -661,6 +1001,7 @@ class SpeedPanel(QFrame):
         self._speed_anim = QTimer(self)
         self._speed_anim.setInterval(33)   # ~30fps
         self._speed_anim.timeout.connect(self._step_speed_anim)
+        motion.register_timer(self._speed_anim)
 
         # 统计开关 / 显示口径与圆钮同步（旧 settings 缺键：开统计、按字）
         self.unit_button.set_tracking_on(bool(getattr(self._settings, "speed_tracking", True)))
@@ -795,28 +1136,63 @@ class SpeedPanel(QFrame):
 
 
 class SaveSpinner(QWidget):
-    """保存指示器：白色半透明圆环内一段深色弧旋转（左下角）。"""
+    """保存指示器：圆环旋转 → 绿勾 / 红叉（左下角）。
+
+    状态机只由真实落盘结果驱动：``start_saving`` 在写入前调用，
+    ``finish_ok`` / ``finish_error`` 只在写入完成（或抛错）后调用。
+    停留时长结束后回到空闲（隐藏），不冒充保存成功。
+    """
+
+    IDLE = "idle"
+    SAVING = "saving"
+    OK = "ok"
+    ERROR = "error"
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedSize(30, 30)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._state = self.IDLE
         self._angle = 0
         self._spin = QTimer(self)
         self._spin.setInterval(33)
         self._spin.timeout.connect(self._tick)
-        self._fade = QTimer(self)
-        self._fade.setSingleShot(True)
-        self._fade.timeout.connect(self.hide)
+        motion.register_timer(self._spin)
+        self._hold = QTimer(self)
+        self._hold.setSingleShot(True)
+        self._hold.timeout.connect(lambda: self.set_state(self.IDLE))
         self.hide()
 
-    def flash(self, ms: int = 600) -> None:
-        self._fade.start(ms)
-        if not self._spin.isActive():
-            self._spin.start()
-        self.show()
-        self.raise_()
+    def set_state(self, state: str, hold_ms: int = 0) -> None:
+        """切换绘制状态；``hold_ms > 0`` 时到点自动回到空闲。"""
+        self._state = state
+        if state == self.SAVING:
+            if not self._spin.isActive():
+                self._spin.start()
+        else:
+            self._spin.stop()
+        if hold_ms > 0 and state in (self.OK, self.ERROR):
+            self._hold.start(hold_ms)
+        elif state != self.IDLE:
+            self._hold.stop()
+        if state == self.IDLE:
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
         self.update()
+
+    def start_saving(self) -> None:
+        self.set_state(self.SAVING)
+
+    def finish_ok(self, hold_ms: int = 600) -> None:
+        self.set_state(self.OK, hold_ms)
+
+    def finish_error(self, hold_ms: int = 1500) -> None:
+        self.set_state(self.ERROR, hold_ms)
+
+    def state(self) -> str:
+        return self._state
 
     def _tick(self) -> None:
         self._angle = (self._angle + 12) % 360
@@ -826,17 +1202,48 @@ class SaveSpinner(QWidget):
         self._spin.stop()
         super().hideEvent(event)
 
+    def _is_dark(self) -> bool:
+        return self.palette().window().color().lightness() < 128
+
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         rect = QRectF(4, 4, 22, 22)
-        pen = QPen(QColor(255, 255, 255, 205), 3.0)
+        dark = self._is_dark()
+        ring = QColor(255, 255, 255, 205) if dark else QColor(20, 22, 26, 150)
+        pen = QPen(ring, 3.0)
         painter.setPen(pen)
-        painter.drawEllipse(rect)                       # 白色半透明圆环
-        pen.setColor(QColor(24, 26, 30, 200))
+        painter.drawEllipse(rect)                       # 圆环底
+        if self._state == self.SAVING:
+            pen.setColor(QColor(24, 26, 30, 200) if not dark else QColor(235, 238, 245, 210))
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawArc(rect, self._angle * 16, 100 * 16)
+            return
+        if self._state == self.OK:
+            color = QColor("#2E9E63") if not dark else QColor("#6FE0A8")
+            self._draw_check(painter, rect, color)
+            return
+        if self._state == self.ERROR:
+            color = QColor("#D0443E") if not dark else QColor("#FF7B72")
+            pen.setColor(color)
+            pen.setWidthF(2.8)
+            painter.setPen(pen)
+            a, b = rect.adjusted(6, 6, -6, -6).topLeft(), rect.adjusted(6, 6, -6, -6).bottomRight()
+            painter.drawLine(a, b)
+            c, d = rect.adjusted(6, 6, -6, -6).topRight(), rect.adjusted(6, 6, -6, -6).bottomLeft()
+            painter.drawLine(c, d)
+
+    def _draw_check(self, painter: QPainter, rect: QRectF, color: QColor) -> None:
+        pen = QPen(color, 3.0)
         pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
         painter.setPen(pen)
-        painter.drawArc(rect, self._angle * 16, 100 * 16)  # 旋转的深色弧段
+        p1 = QPointF(rect.left() + 5.5, rect.center().y())
+        p2 = QPointF(rect.left() + 10.0, rect.bottom() - 6.0)
+        p3 = QPointF(rect.right() - 5.0, rect.top() + 6.0)
+        painter.drawLine(p1, p2)
+        painter.drawLine(p2, p3)
 
 
 class TitleLabel(QLabel):
@@ -861,6 +1268,10 @@ class EditorPage(QWidget):
     title_edited = Signal(str)         # 双击标题后提交的新章节名
     paragraph_settings_requested = Signal()  # 正文右键 / 顶栏请求打开段落设置
     smart_format_requested = Signal()        # 正文右键请求智能排版
+    proofread_requested = Signal()           # 正文右键请求文本体检
+    focus_mode_requested = Signal()          # 正文右键请求进入 / 退出专注模式
+    find_requested = Signal()                # 正文右键请求查找替换
+    new_chapter_requested = Signal()         # 正文右键请求新建章节
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
@@ -882,6 +1293,14 @@ class EditorPage(QWidget):
         self._count_timer.setSingleShot(True)
         self._count_timer.setInterval(120)
         self._count_timer.timeout.connect(self._recount)
+        self._focus_mode = False       # 专注模式：隐藏状态栏、正文铺满、光标行居中
+        self._focus_last_block = -1
+        # 正文内联提示：切章扫一次，编辑后 500ms 防抖重扫；只扫当前章
+        self._inline_enabled = True
+        self._inline_timer = QTimer(self)
+        self._inline_timer.setSingleShot(True)
+        self._inline_timer.setInterval(500)
+        self._inline_timer.timeout.connect(self._refresh_inline)
 
         self._build_ui()
         self._connect()
@@ -903,19 +1322,29 @@ class EditorPage(QWidget):
         outer = QVBoxLayout(body)
         # 与窗口边界 / 目录栏 / 顶部工具栏的间隔约 3 毫米
         # （96dpi 下 1px≈0.26mm；左侧正文到边界 = 6 + 0 + 文档边距 6 = 12px ≈ 3.1mm）
-        outer.setContentsMargins(6, 10, 6, 8)
+        # v1.4.4：下沿不再留 8px——全文字数移入纸张内部，纸张下沿直接贴窗口底边
+        self._base_outer = (6, 10, 6, 0)
+        self._outer_margins = self._base_outer
+        self._top_flush = False
+        self._left_flush = False
+        self._right_flush = False
+        outer.setContentsMargins(*self._outer_margins)
         outer.setSpacing(6)
+        self._body_outer = outer
 
         # 中间是“悬浮白纸”：章节标题融合在纸张内部顶部，铺满写作区（仅留 3mm 边距）
         paper = PaperFrame(self)
         paper.setObjectName("EditorPaper")
+        paper.setProperty("topFlush", False)
+        paper.setProperty("leftFlush", False)
+        paper.setProperty("rightFlush", False)
         paper.setMinimumWidth(320)
         paper.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         apply_shadow(paper, blur=36, alpha=36, dy=8)
         paper_layout = QVBoxLayout(paper)
-        # 内部左右不再留白（外层 6px + 文档边距 6px ≈ 3mm 已够），上下 30px；
-        # 标题与正文之间留 30px 间距
-        paper_layout.setContentsMargins(0, 30, 0, 30)
+        # 内部左右不再留白（外层 6px + 文档边距 6px ≈ 3mm 已够），上 30px；
+        # 下沿 0：状态栏（字数 / 光标 / 保存提示）放在纸张最底部，与窗口底边贴合
+        paper_layout.setContentsMargins(0, 30, 0, 0)
         paper_layout.setSpacing(30)
 
         self.title_label = TitleLabel("未选择章节", self)
@@ -936,32 +1365,43 @@ class EditorPage(QWidget):
         self.title_edit.installEventFilter(self)
         paper_layout.addWidget(self.title_edit)
 
-        self.editor = NovelEditor(paper)
+        # 正文 + 底部状态栏：状态栏进背板（纸张）内部，纸张下沿才能贴住窗口底边
+        body_box = QWidget(paper)
+        body_layout = QVBoxLayout(body_box)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+
+        self.editor = NovelEditor(body_box)
         self.editor.verticalScrollBar().valueChanged.connect(self._remember_scroll)
         self.editor.after_undo = self._restore_format_after_undo
-        paper_layout.addWidget(self.editor, 1)
+        self.editor.after_history = self._after_history_nav
+        body_layout.addWidget(self.editor, 1)
+
+        # 状态栏：字数统计在最左下角，其后是光标位置，保存提示靠右。
+        # 外层包一层控件，专注模式可整行隐藏。
+        self.status_bar = QWidget(body_box)
+        status_row = QHBoxLayout(self.status_bar)
+        status_row.setContentsMargins(18, 4, 18, 8)
+        status_row.setSpacing(10)
+        self.count_label = QLabel("本章 0 字 · 全书 0 字", self.status_bar)
+        self.count_label.setObjectName("EditorStatus")
+        self.cursor_label = QLabel("第 1 行 · 第 1 列", self.status_bar)
+        self.cursor_label.setObjectName("EditorStatus")
+        self.save_label = QLabel("", self.status_bar)
+        self.save_label.setObjectName("SaveHint")
+        status_row.addWidget(self.count_label)
+        status_row.addWidget(self.cursor_label)
+        status_row.addStretch(1)
+        status_row.addWidget(self.save_label)
+        body_layout.addWidget(self.status_bar)
+
+        paper_layout.addWidget(body_box, 1)
 
         outer.addWidget(paper, 1)
         self.paper = paper
 
         # 保存指示器：左下角转圈动画（0.6 秒自动消失）
         self.save_spinner = SaveSpinner(self)
-
-        # 状态栏：字数统计在最左下角，其后是光标位置，保存提示靠右
-        status_row = QHBoxLayout()
-        status_row.setContentsMargins(10, 2, 10, 0)
-        status_row.setSpacing(10)
-        self.count_label = QLabel("本章 0 字 · 全书 0 字", self)
-        self.count_label.setObjectName("EditorStatus")
-        self.cursor_label = QLabel("第 1 行 · 第 1 列", self)
-        self.cursor_label.setObjectName("EditorStatus")
-        self.save_label = QLabel("", self)
-        self.save_label.setObjectName("SaveHint")
-        status_row.addWidget(self.count_label)
-        status_row.addWidget(self.cursor_label)
-        status_row.addStretch(1)
-        status_row.addWidget(self.save_label)
-        outer.addLayout(status_row)
 
         # 右侧常驻工具栏（码字时速），默认隐藏，点击顶部“时速”按钮呼出
         self.speed_panel = SpeedPanel(self.settings, self)
@@ -997,21 +1437,62 @@ class EditorPage(QWidget):
     def _connect(self) -> None:
         self.editor.textChanged.connect(self._on_text_changed)
         self.editor.cursorPositionChanged.connect(self._update_cursor_label)
+        self.editor.cursorPositionChanged.connect(self._follow_focus_cursor)
+        # 输入前把空块换成正文段距（格式命令必须先于插入，见 _prepare_typing_block）
+        self.editor.before_type = self._prepare_typing_block
         # 滚轮监听由 ScrollFlasher 自行挂在编辑器视口上
         # 正文右键菜单：标准编辑菜单 + 段落设置 / 智能排版
         self.editor.setContextMenuPolicy(Qt.CustomContextMenu)
         self.editor.customContextMenuRequested.connect(self._show_editor_menu)
 
-    def _show_editor_menu(self, pos) -> None:
+    def _build_editor_menu(self):
         menu = self.editor.createStandardContextMenu()
+        menu.addSeparator()
+        menu.addAction("新建章节", lambda: self.new_chapter_requested.emit())
         menu.addSeparator()
         menu.addAction("段落设置…", lambda: self.paragraph_settings_requested.emit())
         menu.addAction("智能排版（本章）", lambda: self.smart_format_requested.emit())
+        menu.addAction("文本体检…", lambda: self.proofread_requested.emit())
+        menu.addAction("专注模式（F11）", lambda: self.focus_mode_requested.emit())
+        menu.addSeparator()
+        menu.addAction("粘贴为纯文本", self._paste_plain)
+        menu.addAction("查找替换…", lambda: self.find_requested.emit())
+        return menu
+
+    def _show_editor_menu(self, pos) -> None:
+        menu = self._build_editor_menu()
         menu.exec(self.editor.viewport().mapToGlobal(pos))
+        menu.deleteLater()
+
+    def _paste_plain(self) -> None:
+        """只取剪贴板纯文本插入，不带外部字体 / 颜色 / 段落格式。"""
+        text = QApplication.clipboard().text()
+        if text:
+            self.editor.textCursor().insertText(text)
 
     # ------------------------------------------------------------------
     # 对外接口
     # ------------------------------------------------------------------
+    def set_inline_hints_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._inline_enabled == enabled:
+            return
+        self._inline_enabled = enabled
+        self._inline_timer.stop()
+        self.editor.set_inline_enabled(enabled)
+        if enabled and not self._loading:
+            self._refresh_inline()
+
+    def _refresh_inline(self) -> None:
+        """只扫当前章；关掉开关时不产任何标注。"""
+        if self._loading:
+            return
+        if not self._inline_enabled:
+            self.editor.clear_inline_marks()
+            return
+        text = self.editor.toPlainText()
+        self.editor.set_inline_issues(scan_text(text) if text else [])
+
     def load_text(self, title: str, text: str) -> None:
         """载入章节内容（会清空撤销栈）。"""
         self._loading = True
@@ -1021,7 +1502,9 @@ class EditorPage(QWidget):
             # 新建书之后正文永久点不进、输不进（标题不受影响）。
             self.unlock_editor()
             self.title_label.setText(title)
-            self.editor.setExtraSelections([])
+            self.editor.set_search_selections([])
+            self.editor.clear_inline_marks()
+            self._inline_timer.stop()
             # 字体先落到控件与文档默认字体；正文不烘焙显式字体，
             # 之后改字号才会自动重排（见 _apply_typography）
             self._applied_font = None
@@ -1046,12 +1529,16 @@ class EditorPage(QWidget):
         self._last_count = count_chars(text, self.settings.exclude_punct)
         self._update_status()
         self.chapter_chars_changed.emit(self._last_count)
+        # 进入 / 切换章节时扫一次当前章
+        self._refresh_inline()
 
     def clear_page(self) -> None:
         """没有打开任何书籍时显示的空状态。"""
         self._loading = True
+        self._inline_timer.stop()
         self.title_label.setText("未选择章节")
         self.editor.setPlainText("")
+        self.editor.clear_inline_marks()
         self._loading = False
         self._last_count = 0
         self._total_chars = 0
@@ -1150,11 +1637,19 @@ class EditorPage(QWidget):
         self._total_chars = max(0, total)
         self._update_status()
 
-    def set_saved_text(self, minute: str = "") -> None:
-        self.save_label.setText(f"已自动保存 {minute}" if minute else "")
-        if minute:
-            # 左下角转圈 0.6 秒提示保存成功
-            self.save_spinner.flash()
+    def begin_save(self) -> None:
+        """写入前调用：左下角圆环开始旋转（不发成功信号）。"""
+        self.save_spinner.start_saving()
+
+    def set_save_result(self, ok: bool, minute: str = "", reason: str = "") -> None:
+        """按真实落盘结果切换指示：成功绿勾 0.6 秒，失败红叉 1.5 秒并保留原因。"""
+        if ok:
+            self.save_label.setText(f"已自动保存 {minute}" if minute else "")
+            self.save_spinner.finish_ok(600)
+        else:
+            brief = (reason or "未知原因").splitlines()[0][:120]
+            self.save_label.setText(f"保存失败：{brief}")
+            self.save_spinner.finish_error(1500)
 
     def focus_editor(self) -> None:
         self.editor.setFocus()
@@ -1178,6 +1673,7 @@ class EditorPage(QWidget):
         self.settings = settings
         self.editor.auto_pair = settings.auto_pair
         self.editor.tab_cjk_indent = bool(settings.tab_cjk_indent)
+        self.set_inline_hints_enabled(bool(settings.inline_hints))
         self.jump_top.setVisible(settings.float_jump)
         self.jump_bottom.setVisible(settings.float_jump)
         self._scroll_flasher.set_enabled(settings.fast_scroll)
@@ -1192,6 +1688,104 @@ class EditorPage(QWidget):
         self.chapter_chars_changed.emit(new_count)
 
         self._position_floating()
+
+    def _apply_outer_margins(self) -> None:
+        """按顶栏 / 左栏 / 右栏的贴边状态重算纸张外边距。
+
+        贴边只改纸张绘制边界：对应一侧外边距归 0，另一侧仍保留 6px；
+        正文换行宽度仍由编辑器视口决定，滚动位置在变更后按比例恢复。
+        """
+        left, top, right, bottom = self._base_outer
+        self._outer_margins = (
+            0 if self._left_flush else left,
+            0 if self._top_flush else top,
+            0 if self._right_flush else right,
+            bottom,
+        )
+        self._body_outer.setContentsMargins(*self._outer_margins)
+
+    def _set_paper_flag(self, name: str, value: bool) -> None:
+        """更新纸张的动态属性并重刷 QSS（圆角是否收平由属性选择器决定）。"""
+        if bool(self.paper.property(name)) == value:
+            return
+        self.paper.setProperty(name, value)
+        style = self.paper.style()
+        style.unpolish(self.paper)
+        style.polish(self.paper)
+        self.paper.update()
+
+    def set_top_flush(self, flush: bool) -> None:
+        """顶栏收起时让纸张上沿贴住窗口上沿，并收掉上方两角圆角。
+
+        外层 10px 的顶部留白只在展开态保留；收起态连圆角一起清零，
+        避免窗口上沿出现“底色条 / 圆角空档”。
+        """
+        flush = bool(flush)
+        if self._top_flush == flush:
+            return
+        self._top_flush = flush
+        self._apply_outer_margins()
+        self._set_paper_flag("topFlush", flush)
+
+    def set_side_flush(self, left: bool, right: bool) -> None:
+        """左右栏收起时让纸张对应侧贴住窗口边缘（无底色条、无圆角空档）。
+
+        侧栏显隐没有动画（瞬时切布局），因此不存在“板先跳、栏后收”；
+        若后续给侧栏加动画，需在动画每帧调用本方法做同样处理。
+        """
+        left, right = bool(left), bool(right)
+        if left == self._left_flush and right == self._right_flush:
+            return
+        bar = self.editor.verticalScrollBar()
+        old_value, old_max = bar.value(), bar.maximum()
+        self._left_flush = left
+        self._right_flush = right
+        self._apply_outer_margins()
+        self._set_paper_flag("leftFlush", left)
+        self._set_paper_flag("rightFlush", right)
+
+        def _restore() -> None:
+            hi = bar.maximum()
+            if old_max <= 0 or hi <= 0:
+                return
+            bar.setValue(min(hi, int(old_value / old_max * hi)))
+
+        QTimer.singleShot(0, _restore)
+
+    # ------------------------------------------------------------------
+    # 专注模式
+    # ------------------------------------------------------------------
+    def set_focus_mode(self, enabled: bool) -> None:
+        """进入 / 退出专注模式：只切显隐，不碰正文、光标和撤销栈。"""
+        enabled = bool(enabled)
+        if self._focus_mode == enabled:
+            return
+        self._focus_mode = enabled
+        self.status_bar.setVisible(not enabled)
+        if enabled:
+            self.set_top_flush(True)
+            self.set_side_flush(True, True)
+            self._focus_last_block = -1
+            self.editor.center_cursor()
+            # 侧栏贴边会按比例延迟恢复滚动，这里再排一次居中，确保晚于它执行
+            QTimer.singleShot(0, self._focus_center)
+
+    def _focus_center(self) -> None:
+        if not self._focus_mode:
+            return
+        self.editor.center_cursor()
+        self._focus_last_block = self.editor.textCursor().blockNumber()
+        self.editor.viewport().update()
+
+    def _follow_focus_cursor(self) -> None:
+        """专注模式：跨行移动时把当前行保持在中线，并刷新压暗区域。"""
+        if not self._focus_mode:
+            return
+        block = self.editor.textCursor().blockNumber()
+        if block != self._focus_last_block:
+            self._focus_last_block = block
+            self.editor.center_cursor()
+        self.editor.viewport().update()
 
     def _build_font(self) -> QFont:
         family = self.settings.font_family or DEFAULT_FONT_FAMILY
@@ -1352,9 +1946,38 @@ class EditorPage(QWidget):
             finally:
                 document.setUndoRedoEnabled(True)
 
+    def _em_px(self) -> float:
+        """字号 em 的逻辑像素值（pt × 逻辑 DPI / 72）。
+
+        v1.4.4 起行距倍数以“字号 em”为基准，不再用 fontMetrics().height()：
+        后者随字体自带行间距浮动（同一字号换字体行高就变），跨字体不可预测。
+        Qt 逻辑坐标固定按 96dpi 计算（高 DPI 只体现在 devicePixelRatio），
+        因此 12pt = 16 逻辑 px，125% 屏上 = 20 物理 px，与缩放无关。
+        """
+        points = float(self.editor.font().pointSizeF())
+        if points <= 0:
+            points = float(self.settings.font_size)
+        dpi = float(self.editor.logicalDpiY() or 96.0)
+        return points * dpi / 72.0
+
     def _row_height(self) -> float:
-        """一个正文行的高度：字号派生（字体行高 × 行距），不是写死像素。"""
-        return float(self.editor.fontMetrics().height()) * float(self.settings.line_spacing)
+        """一个正文行的高度：字号 em × 行距（不是写死像素，也不取字体度量行高）。"""
+        return self._em_px() * float(self.settings.line_spacing)
+
+    def _natural_line_height(self) -> float:
+        """Qt 单行文本的自然行高。
+
+        QTextLine 的实际行盒取 max(ceil(ascent+descent), fontMetrics().lineSpacing())：
+        真实 Windows 上雅黑 12pt 为 22（lineSpacing=21 向下取整），
+        离屏平台则会直接采用 lineSpacing（如 23pt 为 36）。按同一口径取最大值，
+        行高补足后空块/单行块整块高度才严格等于 _row_height()。
+        """
+        metrics = QFontMetricsF(self.editor.font(), self.editor)
+        natural = max(
+            float(math.ceil(metrics.ascent() + metrics.descent())),
+            float(self.editor.fontMetrics().lineSpacing()),
+        )
+        return natural
 
     def _line_deficit(self) -> float:
         """首行的“行高补足”。
@@ -1363,8 +1986,7 @@ class EditorPage(QWidget):
         单行块与空块的首行仍是字体自然行高；这里把差额补到块的上边距，
         使单行正文块 / 空块的整块高度也严格等于 _row_height()。
         """
-        natural = float(self.editor.fontMetrics().lineSpacing())
-        return max(0.0, self._row_height() - natural)
+        return max(0.0, self._row_height() - self._natural_line_height())
 
     def _build_body_block_format(self) -> QTextBlockFormat:
         """正文段落的格式（对齐 / 首行缩进 / 段前段后），度量随字号与行高派生。"""
@@ -1438,6 +2060,33 @@ class EditorPage(QWidget):
         else:
             bar.setValue(min(old_value, bar.maximum()))
 
+    def _prepare_typing_block(self) -> None:
+        """空块即将落笔：在插入文字“之前”换成正文段距。
+
+        若等 textChanged 回调里再改（_sync_block_spacing），块格式命令会落在
+        输入命令之后，把连续输入拆成两个撤销步——一次 Ctrl+Z 只撤掉后半段，
+        第一个字撤不掉。这里把格式命令提前，保证整段输入仍是一步撤销。
+        """
+        if self._loading or self._applied_para is None:
+            return
+        block = self.editor.textCursor().block()
+        if not block.isValid() or block.text().strip():
+            return
+        want = self._build_body_block_format()
+        fmt = block.blockFormat()
+        if (abs(fmt.topMargin() - want.topMargin()) < 0.05
+                and abs(fmt.bottomMargin() - want.bottomMargin()) < 0.05
+                and abs(fmt.textIndent() - want.textIndent()) < 0.05):
+            return
+        # 改块格式也会触发 textChanged；临时置 _loading 挡掉 _sync_block_spacing，
+        # 否则空块会先被换成正文段距、又被判回空块，来回抖动并把撤销拆开
+        was_loading = self._loading
+        self._loading = True
+        try:
+            QTextCursor(block).mergeBlockFormat(want)
+        finally:
+            self._loading = was_loading
+
     def _sync_block_spacing(self) -> None:
         """把光标所在块的“空 / 非空”状态与段落格式对齐。
 
@@ -1456,7 +2105,12 @@ class EditorPage(QWidget):
                 and abs(fmt.bottomMargin() - want.bottomMargin()) < 0.05
                 and abs(fmt.textIndent() - want.textIndent()) < 0.05):
             return
-        QTextCursor(block).mergeBlockFormat(want)
+        # 并入“这次输入”的撤销步：否则第一次输入时把空块换成正文段距会另起一个
+        # 撤销块，一次 Ctrl+Z 只撤掉后面几个字，第一个字撤不掉（排版污染撤销）。
+        cursor = QTextCursor(block)
+        cursor.joinPreviousEditBlock()
+        cursor.mergeBlockFormat(want)
+        cursor.endEditBlock()
 
     def apply_writing_background(self) -> None:
         """根据设置应用写作区背景：预设色块走 QSS，自定义图片走自绘。"""
@@ -1473,9 +2127,11 @@ class EditorPage(QWidget):
             return
         # 空块 / 正文块的段距与缩进随“空 / 非空”即时对齐
         self._sync_block_spacing()
-        # 文本变化后旧的查找高亮已经失效，直接清除
-        if self.editor.extraSelections():
-            self.editor.setExtraSelections([])
+        # 文本变化后查找高亮与内联标注位置全部失效：先清空，静止 500ms 后重扫当前章
+        self.editor.set_search_selections([])
+        self.editor.clear_inline_marks()
+        if self._inline_enabled:
+            self._inline_timer.start()
         # 只有键盘敲出来的字才计入码字速度与每日打字统计（粘贴 / 拖放不计）
         if not getattr(self.editor, "_paste_insert", False):
             self._pending_keyboard = True
@@ -1543,6 +2199,26 @@ class EditorPage(QWidget):
     def redo(self) -> None:
         self.editor.redo()
 
+    def _after_history_nav(self, before: str) -> None:
+        """撤销 / 重做后补齐一次状态同步。
+
+        ``NovelEditor.undo/redo`` 期间 ``_undoing`` 为真，``_on_text_changed``
+        会直接返回：底部字数会停在撤销前的值，``content_edited`` 也不发，
+        导致撤销后不再触发自动保存。这里在操作结束后补算一次字数并通知落盘；
+        撤销不是键盘输入，不写入码字速度统计。
+        """
+        if self._loading or self.editor.toPlainText() == before:
+            return
+        self._sync_block_spacing()
+        self.editor.set_search_selections([])
+        self.editor.clear_inline_marks()
+        if self._inline_enabled:
+            self._inline_timer.start()
+        self._count_timer.stop()
+        self._pending_keyboard = False
+        self._recount()
+        self.content_edited.emit()
+
     def jump_to_top(self) -> None:
         cursor = self.editor.textCursor()
         cursor.movePosition(QTextCursor.Start)
@@ -1593,9 +2269,32 @@ class EditorPage(QWidget):
         self.editor.setTextCursor(cursor)
         return True
 
+    def apply_replacements(self, ranges: list[tuple[int, int, str]]) -> int:
+        """按 (起点, 长度, 替换文本) 批量替换正文；整批合并为一个撤销步骤。
+
+        调用方负责保证位置与当前正文一致；从后往前替换避免偏移错位。
+        """
+        if not ranges:
+            return 0
+        document = self.editor.document()
+        max_pos = max(0, document.characterCount() - 1)
+        group = QTextCursor(document)
+        group.beginEditBlock()
+        applied = 0
+        for start, length, replacement in sorted(ranges, key=lambda r: r[0], reverse=True):
+            begin = max(0, min(start, max_pos))
+            end = max(begin, min(begin + max(1, length), max_pos))
+            cursor = QTextCursor(document)
+            cursor.setPosition(begin)
+            cursor.setPosition(end, QTextCursor.KeepAnchor)
+            cursor.insertText(replacement)
+            applied += 1
+        group.endEditBlock()
+        return applied
+
     def highlight_all(self, needle: str, case_sensitive: bool) -> int:
         """高亮当前章节中所有匹配项，返回匹配总数。"""
-        self.editor.setExtraSelections([])
+        self.editor.set_search_selections([])
         if not needle:
             return 0
         text = self.editor.toPlainText()
@@ -1615,7 +2314,7 @@ class EditorPage(QWidget):
             fmt.setBackground(color)
             selection.format = fmt
             selections.append(selection)
-        self.editor.setExtraSelections(selections)
+        self.editor.set_search_selections(selections)
         return len(matches)
 
     def refresh_icons(self, factory: IconFactory) -> None:

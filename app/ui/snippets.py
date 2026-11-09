@@ -40,6 +40,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.ui.context_menu import make_menu, popup
+
 from app.models import new_id
 from app.ui import surface
 from app.ui.icons import IconFactory
@@ -267,6 +269,14 @@ class _SnippetCard(QWidget):
         self.update()
         super().leaveEvent(event)
 
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        popup(make_menu(self, [
+            ("编辑片段", lambda: self.edit_clicked.emit(self.item_id())),
+            ("复制片段", lambda: self.copy_clicked.emit(self.item_id())),
+            None,
+            ("删除片段", lambda: self.delete_clicked.emit(self.item_id())),
+        ]), event.globalPos())
+
     def _paint_chrome(self, painter: QPainter, damaged) -> None:
         """卡片底板（悬停底色 / 圆角）优先用缓存位图；超长卡片按可视区裁剪绘制。"""
         w, h = self.width(), self.height()
@@ -397,6 +407,7 @@ class _SnippetListView(QScrollArea):
     edit_requested = Signal(str)
     delete_requested = Signal(str)
     reorder_requested = Signal(str, int)
+    menu_requested = Signal(QPoint)   # 空白处右键 → 面板统一给菜单
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -428,6 +439,11 @@ class _SnippetListView(QScrollArea):
         self.verticalScrollBar().valueChanged.connect(lambda _v: self._update_visible())
         self._flasher = attach_flasher(self, Qt.Orientation.Vertical, inset=4, edge_margin=6)
         self._flasher.watch(self._canvas)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        """列表空白处右键：交给面板出「新增 / 搜索 / 收起」菜单。"""
+        self.menu_requested.emit(event.globalPos())
+        event.accept()
 
     # ------------------------------------------------------------------
     def set_theme(self, theme: dict) -> None:
@@ -860,6 +876,7 @@ class SnippetsPanel(QWidget):
         self.list_view.edit_requested.connect(self.edit_snippet)
         self.list_view.delete_requested.connect(self.delete_snippet)
         self.list_view.reorder_requested.connect(self.reorder_snippet)
+        self.list_view.menu_requested.connect(self._show_blank_menu)
         self.empty_label = QLabel("", self)
         self.empty_label.setObjectName("SnippetHint")
         self.empty_label.setWordWrap(True)
@@ -871,6 +888,22 @@ class SnippetsPanel(QWidget):
         self.status_label = QLabel("", self)
         self.status_label.setObjectName("SnippetMeta")
         layout.addWidget(self.status_label)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        """面板空白处右键：只列片段栏真能做到的事。"""
+        self._show_blank_menu(event.globalPos())
+
+    def _show_blank_menu(self, global_pos) -> None:
+        popup(make_menu(self, [
+            ("新增片段", self.open_add_dialog),
+            ("搜索片段", self._focus_search),
+            None,
+            ("收起片段栏", self.close_requested.emit),
+        ]), global_pos)
+
+    def _focus_search(self) -> None:
+        self.search_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.search_edit.selectAll()
 
     def set_theme(self, theme: dict) -> None:
         self._theme = {**_FALLBACK_THEME, **theme}
