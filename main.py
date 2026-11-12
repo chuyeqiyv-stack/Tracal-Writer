@@ -24,6 +24,15 @@ from app.ui.main_window import MainWindow
 
 startup_trace.mark("imports")
 
+# v1.5.1：窗口版没有 stderr，未捕获异常写入 <数据目录>\logs\error.log。
+# 安装失败或写日志失败都不能影响启动。
+try:
+    from app import error_log
+
+    error_log.install(config.DATA_DIR)
+except Exception:   # noqa: BLE001
+    pass
+
 
 def main() -> int:
     """创建应用、载入本地数据并显示主窗口。"""
@@ -55,16 +64,28 @@ def main() -> int:
     # 整份 library.json 回写会把另一进程刚保存的时间轴事件覆盖掉。
     lock = InstanceLock(config.DATA_DIR)
     if not lock.acquire():
-        pid = lock.holder_pid()
-        QMessageBox.warning(
-            None,
-            "催客写作已在运行",
-            "检测到另一个「催客写作」正在使用同一数据目录：\n"
-            f"{config.DATA_DIR}\n\n"
-            + (f"占用进程 PID：{pid}\n\n" if pid else "")
-            + "为避免两个窗口互相覆盖数据，本次启动已退出。\n"
-            "请先关闭已打开的窗口，再重新启动。",
-        )
+        if lock.failure == "unwritable":
+            # v1.5.3：只读数据目录同样会让 tryLock 失败，不能误报成“已在运行”
+            QMessageBox.warning(
+                None,
+                "数据目录不可写",
+                "无法写入数据目录：\n"
+                f"{config.DATA_DIR}\n\n"
+                "这不是「程序已在运行」，而是当前目录没有写入权限"
+                "（或所在磁盘只读、空间已满）。\n\n"
+                "请检查该目录的权限，或在设置中更换到一个可写的数据目录后重试。",
+            )
+        else:
+            pid = lock.holder_pid()
+            QMessageBox.warning(
+                None,
+                "催客写作已在运行",
+                "检测到另一个「催客写作」正在使用同一数据目录：\n"
+                f"{config.DATA_DIR}\n\n"
+                + (f"占用进程 PID：{pid}\n\n" if pid else "")
+                + "为避免两个窗口互相覆盖数据，本次启动已退出。\n"
+                "请先关闭已打开的窗口，再重新启动。",
+            )
         return 1
     app.aboutToQuit.connect(lock.release)
     startup_trace.mark("lock")
