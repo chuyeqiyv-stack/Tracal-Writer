@@ -1,7 +1,22 @@
 {
-  "latest": "1.8.1",
-  "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/tag/v1.8.1",
-  "published_at": "2026-11-13T12:00:00+08:00",
-  "notes": "1. 合集卡：新增双栏编辑窗口，左侧有序条目、右侧单篇独立编辑\n2. 合集卡：支持从仓库批量导入，并标注每个设定已加入几个合集\n3. 合集卡：删除分为三条路径——从本合集移除、移出到顶层、永久删除；改名会同步到所有合集\n4. 设置新增「界面缩放」小 / 标准 / 大 / 特大四档，按钮、列表、卡片等界面元素同步放大\n5. 修复主窗口首次显示时底边压住任务栏的问题\n6. 章节保存新增节流 .bak（10 分钟或累计 2000 字），每章一份滚动覆盖；整书快照最多保留 3 份\n7. 新增启动更新检查：有新版本会在书架顶部提示，可一键打开下载页或跳过此版本",
-  "mirrors": []
+  "latest": "1.8.2",
+  "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/tag/v1.8.2",
+  "published_at": "2026-11-13T22:12:53+08:00",
+  "notes": "1. 新增公告功能：书架顶部显示最新公告，右侧 × 可关闭；「设置 → 关于」可查看全部有效公告\n2. 新增程序内下载：关于页提供「下载安装包」「下载便携版」，带进度条、百分比、取消与重试\n3. 下载完成后按 update.json 的 size / sha256 校验，文件先写 .part 再改名；只接受 https 直链\n4. 修复开启代理后仍无法检查更新：自动读取 Windows 系统代理，其次环境变量，最后直连\n5. 更新检查失败区分「文件不存在（HTTP 4xx）/ 连不上 / 服务器错误 / 格式异常」，日志带状态码或异常类型\n6. 书架顶部保留更新通知条，检查失败也会显示并带 ×；公告读取失败静默处理，不影响更新提示",
+  "assets": [
+    {
+      "name": "安装包",
+      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/v1.8.2/%E5%82%AC%E5%AE%A2%E5%86%99%E4%BD%9C_Trecal_1.8.2_Setup.exe",
+      "size": 25896122,
+      "sha256": "e76a3aaa0cd51f0a353d6243d49c8d54a688e6c4d5c0f0f61b27b333b3e50ebe"
+    },
+    {
+      "name": "便携版",
+      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/v1.8.2/%E5%82%AC%E5%AE%A2%E5%86%99%E4%BD%9C_Trecal_1.8.2_Portable.zip",
+      "size": 32085068,
+      "sha256": "73f2748dc5461ea925b127884ae307ae8e24fb2e80abfd7e1c7bdd2ed52a2032"
+    }
+  ],
+  "mirrors": [],
+  "_note": "assets 的 url 为 GitHub Release 资产直链（中文文件名需百分号编码，用 quote(filename) 生成）。上传同名文件后即可直接下载；打包脚本会自动填入本地产物的真实字节数与 sha256。若某项暂无直链，删掉该项即可，界面会自动回退为打开 GitHub 发布页。"
 }
