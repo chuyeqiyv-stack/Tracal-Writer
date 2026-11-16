@@ -1,18 +1,18 @@
 {
   "latest": "1.8.6",
-  "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/tag/v1.8.6",
+  "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/tag/1.8.6",
   "published_at": "2026-11-16T20:29:26+08:00",
   "notes": "1. 切换深浅色 / 主题不再顿一下：样式表无实质变化时跳过整棵界面重建，实测约 280ms 降到 12ms\n2. 写作主题面板连点色块改为合帧刷新（30ms 内合并），连点多次不再每次都冻结界面\n3. 启动更快：主界面模块延后到启动动画首帧之后加载，导入耗时约 250ms 降到 163ms\n4. 更省内存：随机取名词库与校对词库改为首次使用时才加载，常驻内存少约 1.9MB\n5. 设定关系画布：宇宙数据加文件签名缓存，反复刷新不再重复读盘解析\n6. 云同步更稳：WebDAV 上传 / 下载补上超时（连接 15 秒、传输 300 秒），云端无响应不再永久卡住同步\n7. 本次为纯性能与稳定性更新，功能、界面细节与特效均未改动",
   "assets": [
     {
       "name": "安装包",
-      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/v1.8.6/%E5%82%AC%E5%AE%A2%E5%86%99%E4%BD%9C_Trecal_1.8.6_Setup.exe",
+      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/1.8.6/_Trecal_1.8.6_Setup.exe",
       "size": 26536455,
       "sha256": "00d40619a16d437ab1030fc4f846dafe3e3a70f4bf9b9f7df4fb06d10d29d672"
     },
     {
       "name": "便携版",
-      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/v1.8.6/%E5%82%AC%E5%AE%A2%E5%86%99%E4%BD%9C_Trecal_1.8.6_Portable.zip",
+      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/1.8.6/_Trecal_1.8.6_Portable.zip",
       "size": 32717908,
       "sha256": "d63cf3977445fad4ce26ea0f43804eae3bc4972ec34d6df4a6ea936f181c6fa9"
     }
