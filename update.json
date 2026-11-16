@@ -1,20 +1,20 @@
 {
-  "latest": "1.8.2",
-  "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/tag/v1.8.2",
-  "published_at": "2026-11-13T22:12:53+08:00",
-  "notes": "1. 新增公告功能：书架顶部显示最新公告，右侧 × 可关闭；「设置 → 关于」可查看全部有效公告\n2. 新增程序内下载：关于页提供「下载安装包」「下载便携版」，带进度条、百分比、取消与重试\n3. 下载完成后按 update.json 的 size / sha256 校验，文件先写 .part 再改名；只接受 https 直链\n4. 修复开启代理后仍无法检查更新：自动读取 Windows 系统代理，其次环境变量，最后直连\n5. 更新检查失败区分「文件不存在（HTTP 4xx）/ 连不上 / 服务器错误 / 格式异常」，日志带状态码或异常类型\n6. 书架顶部保留更新通知条，检查失败也会显示并带 ×；公告读取失败静默处理，不影响更新提示",
+  "latest": "1.8.6",
+  "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/tag/v1.8.6",
+  "published_at": "2026-11-16T20:29:26+08:00",
+  "notes": "1. 切换深浅色 / 主题不再顿一下：样式表无实质变化时跳过整棵界面重建，实测约 280ms 降到 12ms\n2. 写作主题面板连点色块改为合帧刷新（30ms 内合并），连点多次不再每次都冻结界面\n3. 启动更快：主界面模块延后到启动动画首帧之后加载，导入耗时约 250ms 降到 163ms\n4. 更省内存：随机取名词库与校对词库改为首次使用时才加载，常驻内存少约 1.9MB\n5. 设定关系画布：宇宙数据加文件签名缓存，反复刷新不再重复读盘解析\n6. 云同步更稳：WebDAV 上传 / 下载补上超时（连接 15 秒、传输 300 秒），云端无响应不再永久卡住同步\n7. 本次为纯性能与稳定性更新，功能、界面细节与特效均未改动",
   "assets": [
     {
       "name": "安装包",
-      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/v1.8.2/%E5%82%AC%E5%AE%A2%E5%86%99%E4%BD%9C_Trecal_1.8.2_Setup.exe",
-      "size": 25896122,
-      "sha256": "e76a3aaa0cd51f0a353d6243d49c8d54a688e6c4d5c0f0f61b27b333b3e50ebe"
+      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/v1.8.6/%E5%82%AC%E5%AE%A2%E5%86%99%E4%BD%9C_Trecal_1.8.6_Setup.exe",
+      "size": 26536455,
+      "sha256": "00d40619a16d437ab1030fc4f846dafe3e3a70f4bf9b9f7df4fb06d10d29d672"
     },
     {
       "name": "便携版",
-      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/v1.8.2/%E5%82%AC%E5%AE%A2%E5%86%99%E4%BD%9C_Trecal_1.8.2_Portable.zip",
-      "size": 32085068,
-      "sha256": "73f2748dc5461ea925b127884ae307ae8e24fb2e80abfd7e1c7bdd2ed52a2032"
+      "url": "https://github.com/chuyeqiyv-stack/Tracal-Writer/releases/download/v1.8.6/%E5%82%AC%E5%AE%A2%E5%86%99%E4%BD%9C_Trecal_1.8.6_Portable.zip",
+      "size": 32717908,
+      "sha256": "d63cf3977445fad4ce26ea0f43804eae3bc4972ec34d6df4a6ea936f181c6fa9"
     }
   ],
   "mirrors": [],

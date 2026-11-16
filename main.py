@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """催客写作 —— 程序入口。
 
-纯本地单机小说写作软件：所有数据都保存在本机 JSON 文件中，
-不包含云同步、账号登录等任何联网功能。
+纯本地单机小说写作软件：作品内容只保存在本机 JSON 文件中，没有账号体系，
+开发者侧不收集也不上传任何用户数据。会发起网络请求的只有两处，且都要用户先动手：
+WebDAV 备份需自行填写地址与应用密码；更新与公告检查只读远端 JSON，不自动下载安装。
 
 运行方式：
     python main.py
@@ -20,7 +21,6 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from app import config
 from app.single_instance import InstanceLock
 from app.storage import Storage
-from app.ui.main_window import MainWindow
 
 startup_trace.mark("imports")
 
@@ -104,11 +104,17 @@ def main() -> int:
         boot.start()
 
         def _build_main_window() -> None:
+            # 主窗口整棵 UI 依赖（characters / dialogs / widgets 等约 200ms 导入）
+            # 放在莲花首帧之后，让动画先上屏
+            from app.ui.main_window import MainWindow
+
             boot.mark_ready(MainWindow(storage))
 
         QTimer.singleShot(0, _build_main_window)
     else:
         # 关闭动画时零额外开销
+        from app.ui.main_window import MainWindow
+
         window = MainWindow(storage)
         window.show()
 

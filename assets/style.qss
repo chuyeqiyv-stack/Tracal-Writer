@@ -241,7 +241,7 @@ QTextEdit#Preview {
     background: transparent;
     border: none;
     border-radius: 4px;
-    color: $subtext;
+    color: $subtext_strong;
     font-size: 11px;
     padding: 3px 7px;
 }
@@ -252,7 +252,7 @@ QTextEdit#Preview {
 QFrame#MessageBox {
     background: $panel;
     border: 1px solid $border;
-    border-radius: 14px;
+    border-radius: ${radius_lg}px;
 }
 QLabel#MsgTitle {
     font-size: 16px;
@@ -404,7 +404,9 @@ QPushButton#NameChip:checked {
 /* ---------------- 设置抽屉 ---------------- */
 #Drawer { background: $sidebar_glass; border-left: 1px solid $glass_border; }
 #DrawerTitle { font-size: 16px; font-weight: 600; color: $text; }
-#SectionTitle { font-size: 11px; font-weight: 600; color: $subtext; letter-spacing: 1px; }
+#SectionTitle { font-size: 11px; font-weight: 600; color: $subtext_strong; letter-spacing: 1px; }
+/* 设置分组卡片：圆角面板 + 细描边，替代原来的 1px 分隔线 */
+#SettingsSection { background: $panel_alt; border: 1px solid $border; border-radius: ${radius}px; }
 #RowTitle { color: $text; }
 #SegContainer { background: $hover; border: none; border-radius: ${radius}px; }
 #SegButton {
@@ -412,7 +414,7 @@ QPushButton#NameChip:checked {
     border: none;
     border-radius: ${radius_sm}px;
     padding: 7px 11px;
-    color: $subtext;
+    color: $subtext_strong;
     font-size: 12px;
 }
 #SegButton:hover { color: $text; }
@@ -452,6 +454,16 @@ QPushButton#NameChip:checked {
 #ShowcaseTag { background: $accent_soft; color: $accent; border: none; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 600; }
 #UserName { font-size: 13px; font-weight: 600; color: $text; }
 #UserHint { font-size: 10px; color: $subtext; }
+/* ---------------- 公告 / 新版本顶层弹窗 ---------------- */
+QDialog#NoticeDialog { background: transparent; }
+#NoticeCard { background: $panel; border: 1px solid $border; border-radius: ${radius_lg}px; }
+#NoticeEyebrow { color: $accent; font-size: 12px; font-weight: 700; }
+#NoticeTitle { font-size: 22px; font-weight: 700; color: $text; }
+#NoticeMeta { font-size: 12px; color: $subtext; }
+#NoticeBody { font-size: 14px; color: $text; background: transparent; }
+#NoticeScroll { background: transparent; border: none; }
+#NoticeCheck { color: $subtext; font-size: 12px; }
+#NoticeCheck:hover { color: $text; }
 #StatCard { background: $panel; border: none; border-radius: ${radius_lg}px; }
 #StatValue { font-size: 22px; font-weight: 700; color: $text; }
 #StatLabel { font-size: 11px; color: $subtext; }
